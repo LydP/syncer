@@ -10,11 +10,10 @@ is written.
 
 ## Status
 
-**Planning only — there is no application yet.**
-
-This repo currently holds the design work: a domain glossary, architecture decisions, and a
-[wayfinder](.claude/skills/wayfinder) planning effort that ends at a build-ready spec. Building
-the tool is a separate effort that has not started.
+**Building.** Planning finished at a build-ready [`spec.md`](.scratch/local-file-syncer/spec.md);
+the build itself is tracked as [GitHub issues](https://github.com/LydP/syncer/issues), one per
+spec area, worked roughly in order. Issue `#1` (project scaffolding & portable storage) has an
+initial implementation; nothing is released yet.
 
 ## How it will work
 
@@ -47,18 +46,28 @@ or cloud sync · pulling upstream repos (done by hand).
 
 | Path | What |
 |------|------|
+| `src/syncer/` | Application source (src-layout). |
+| `tests/` | Pytest suite. |
 | [`CONTEXT.md`](CONTEXT.md) | Domain glossary — master, replica, sync rule, check, sync, drift, divergence. |
 | [`docs/adr/`](docs/adr/) | Architecture Decision Records. |
 | [`docs/agents/`](docs/agents/) | How agent skills consume this repo (issue tracker, domain docs). |
-| `.scratch/local-file-syncer/` | The active planning effort: `map.md`, `issues/NN-*.md`, and captured research. |
+| `.scratch/local-file-syncer/` | The completed planning effort — historical record: `map.md`, resolved `issues/NN-*.md`, and the `spec.md` it produced. |
 | [`CLAUDE.md`](CLAUDE.md) | Guidance for Claude Code. |
 
-## Planning workflow
+## Build workflow
 
-Planning is driven by the `/wayfinder` skill against `.scratch/local-file-syncer/map.md`. Open
-questions live as numbered tickets under `issues/`, each with a `Type:` (`research` / `prototype`
-/ `grilling` / `task`), a `Status:`, and optional `Blocked by:` dependencies. Tickets resolve
-into the map's "Decisions so far"; the final ticket assembles everything into `spec.md`.
+Work is tracked as [GitHub issues](https://github.com/LydP/syncer/issues) `#1`–`#8`, one per
+`spec.md` section, worked roughly in issue-number order. Set up a dev environment with:
 
-This is not a git repository — research findings are captured as files under the effort directory
-rather than on a branch.
+```
+python -m venv venv
+venv\Scripts\pip install -e ".[dev]"       # add ",gui" too for GUI work
+venv\Scripts\python -m pytest
+```
+
+## Planning history
+
+Planning was driven by the `/wayfinder` skill against
+[`.scratch/local-file-syncer/map.md`](.scratch/local-file-syncer/map.md) and ended at the
+build-ready [`spec.md`](.scratch/local-file-syncer/spec.md). Kept for reference; new work goes to
+GitHub issues, not new tickets there.

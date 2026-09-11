@@ -1,0 +1,29 @@
+[project]
+name = "syncer"
+version = "0.1.0"
+description = "Offline, Windows-only one-way file/folder sync tool."
+requires-python = ">=3.11"
+dependencies = [
+    "tomli-w",
+]
+
+[project.optional-dependencies]
+# PySide6 is a ~250MB download; only the GUI (issue #8) and the frozen build
+# need it, so non-GUI work installs without it.
+gui = [
+    "PySide6",
+]
+dev = [
+    "pytest",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/syncer"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

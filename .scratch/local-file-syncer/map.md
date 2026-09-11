@@ -12,7 +12,7 @@ We know whether a free existing tool covers the need; if not, a build-ready spec
 - **Planning only.** This map ends at a spec. Do not implement the tool from these tickets.
 - **Skills to consult each session**: `grilling` + `domain-modeling` by default; `research` for the tool survey; `prototype` for UI-shape questions.
 - **Settled going in** (constraints, not open questions): one-way fan-out, master wins, no merge, no reverse push · one sync rule per syncable unit · Python + PySide desktop GUI · on-demand check only (no watching) · Windows only · human-readable config file + separate state file, both GUI-managed · content-based comparison (not timestamps) · first-time provisioning (missing replica) handled the same as an update · deletions propagate but are confirmed as a separate category.
-- **Tracker**: local markdown (`docs/agents/issue-tracker.md`). This is not a git repo, so research findings are captured as files under this effort dir, not on a branch.
+- **Tracker**: local markdown (`docs/agents/issue-tracker.md`). At the time this planning effort ran, the repo had no git history, so research findings were captured as files under this effort dir rather than on a branch. (The repo has since gained git + a GitHub remote for the build effort — see `CLAUDE.md`.)
 
 ## Decisions so far
 
