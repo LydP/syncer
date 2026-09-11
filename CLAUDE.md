@@ -66,3 +66,13 @@ convention.
   A concept missing from the glossary is a signal — note it for `/domain-modeling`.
 - If files like `CONTEXT.md` or ADRs are absent for an area, proceed silently; the
   `/domain-modeling` skill creates them lazily when terms or decisions actually get resolved.
+
+## Development workflow
+
+Each step below is run at the user's discretion — they may run all steps in one session or spread them across multiple sessions.
+
+1. `/tdd` — implement using red-green-refactor; work through the full PRD behavior list. 
+2. `/simplify` — reuse, simplification, and altitude cleanups; applies fixes automatically
+3. `/code-review` — correctness and deeper review pass; sees the cleaned-up code from steps 2 and 3
+4. `/security-review` — security pass
+5. **Commit** — captures all changes and the updated graph together
