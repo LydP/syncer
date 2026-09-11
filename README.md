@@ -3,17 +3,15 @@
 A general-purpose, offline, Windows-only tool that keeps copies of files and folders current with
 a single canonical original.
 
-It exists because keeping the same content — Claude Code skill folders, a resume — identical
-across many project directories by hand is error-prone. Point Syncer at one **master**, list the
-places it should be copied to, and run a **check** to see exactly what has drifted before anything
-is written.
+It exists because keeping the same content identical across many project directories by hand is
+error-prone. Point Syncer at one **master**, list the places it should be copied to, and run a
+**check** to see exactly what has drifted before anything is written.
 
 ## Status
 
 **Building.** Planning finished at a build-ready [`spec.md`](.scratch/local-file-syncer/spec.md);
 the build itself is tracked as [GitHub issues](https://github.com/LydP/syncer/issues), one per
-spec area, worked roughly in order. Issue `#1` (project scaffolding & portable storage) has an
-initial implementation; nothing is released yet.
+spec area, worked roughly in order. Nothing is released yet.
 
 ## How it will work
 

@@ -10,10 +10,10 @@ skill folders current across many project directories (each project taking its o
 mirroring one master resume file into many directories.
 
 **Application code has started.** The planning effort produced a build-ready `spec.md`, and the
-build effort is now underway, tracked as GitHub issues (see below), not local tickets. Issue `#1`
-(project scaffolding & portable storage) has an implementation on disk
-(`src/syncer/storage.py` + `tests/test_storage.py`) but is not yet committed/merged — check
-`git status` / issue `#1`'s state before assuming it's done.
+build effort is now underway, tracked as GitHub issues (see below), not local tickets. Don't infer
+an issue's status from this file — check `git status` for uncommitted work and `gh issue list`
+for open/closed state directly; GitHub's auto-close via a commit's `Closes #N` can lag behind a
+direct push to `master`, so a closed-looking issue may still show open for a while.
 
 This **is a git repository** (`origin` → `github.com/LydP/syncer`). Build work happens on
 branches/PRs against GitHub issues in the usual way.
@@ -30,7 +30,7 @@ a ~250MB download.
 
 | Path | What |
 |------|------|
-| `src/syncer/` | Application source, src-layout. `storage.py` (issue `#1`) resolves `base_dir`, checks writability, and provisions the storage layout — see ADR 0001. |
+| `src/syncer/` | Application source, src-layout. `storage.py` (issue `#1`) resolves `base_dir`, checks writability, and provisions the storage layout — see ADR 0001. `config.py` (issue `#2`) loads/saves/validates `config.toml`: `load_config`/`save_config`, uniqueness validation, atomic writes with rolling backups, and `ConfigStore` for reload / warn-before-clobber. |
 | `tests/` | Pytest suite, one `test_<module>.py` per `src/syncer/<module>.py`. |
 | `CONTEXT.md` | Domain glossary — the authoritative vocabulary. Read first. |
 | `docs/adr/` | Architecture Decision Records. Read any that touch your area; flag contradictions rather than silently overriding (`docs/agents/domain.md`). |
