@@ -1,7 +1,9 @@
+import os
 import sys
 import tempfile
 import tomllib
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 PROJECT_ROOT_MARKER = "pyproject.toml"
@@ -82,6 +84,26 @@ def ensure_base_dir_writable(base_dir: Path) -> None:
             pass
     except OSError as exc:
         raise BaseDirNotWritableError(f"{base_dir} is not writable") from exc
+
+
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write via `<name>.tmp` + `os.replace`, so a crash never leaves `path`
+    half-written; the temp file is removed if anything fails.
+    """
+    tmp_path = path.with_name(path.name + ".tmp")
+    try:
+        tmp_path.write_bytes(data)
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def utc_file_stamp() -> str:
+    """Timestamp for generated file names. UTC, so name order stays
+    chronological across DST/clock changes — backup pruning relies on it.
+    """
+    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
 
 
 def ensure_storage_layout(base_dir: Path) -> StorageLayout:

@@ -1,5 +1,12 @@
 import pytest
 
+from syncer.storage import ensure_storage_layout
+
+
+@pytest.fixture
+def layout(tmp_path):
+    return ensure_storage_layout(tmp_path)
+
 
 @pytest.fixture
 def master_and_replica(tmp_path):

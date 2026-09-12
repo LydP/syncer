@@ -16,14 +16,8 @@ from syncer.config import (
     normalize_replica_path,
     save_config,
 )
-from syncer.storage import ensure_storage_layout
 
 CONFIG_HEADER = "version = 1\n\n[settings]\n\n"
-
-
-@pytest.fixture
-def layout(tmp_path):
-    return ensure_storage_layout(tmp_path)
 
 
 def _rule_toml(rule_id, master, replicas):

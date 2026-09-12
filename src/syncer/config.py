@@ -4,12 +4,11 @@ import shutil
 import tomllib
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 
 import tomli_w
 
-from syncer.storage import SyncerError
+from syncer.storage import SyncerError, atomic_write_bytes, utc_file_stamp
 
 MAX_CONFIG_BACKUPS = 10
 MASTER_TYPES = ("dir", "file")
@@ -137,10 +136,7 @@ def _write_backup(config_path: Path, backups_dir: Path) -> None:
     backups = sorted(backups_dir.glob("config-*.toml"))
     if backups and filecmp.cmp(config_path, backups[-1], shallow=False):
         return  # newest backup already holds this content; don't spend a slot on it
-    # UTC, so name order stays chronological across DST/clock changes — pruning
-    # relies on it.
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
-    shutil.copy2(config_path, backups_dir / f"config-{timestamp}.toml")
+    shutil.copy2(config_path, backups_dir / f"config-{utc_file_stamp()}.toml")
     _prune_old_backups(backups_dir)
 
 
@@ -159,14 +155,7 @@ def save_config(config_path: Path, config: Config, backups_dir: Path) -> None:
     had_previous_version = config_path.exists()
     if had_previous_version:
         _write_backup(config_path, backups_dir)
-    tmp_path = config_path.with_name(config_path.name + ".tmp")
-    try:
-        with open(tmp_path, "wb") as fh:
-            tomli_w.dump(_config_to_dict(config), fh)
-        os.replace(tmp_path, config_path)
-    except BaseException:
-        tmp_path.unlink(missing_ok=True)
-        raise
+    atomic_write_bytes(config_path, tomli_w.dumps(_config_to_dict(config)).encode("utf-8"))
     if not had_previous_version:
         # Nothing was overwritten, but spec §4 wants a backup on every save.
         _write_backup(config_path, backups_dir)

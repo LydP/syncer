@@ -18,6 +18,8 @@ _IGNORED_FILE_RE = re.compile(
 )
 
 _HASH_CHUNK_BYTES = 65536
+# Recorded in state.json; a stored baseline hashed with anything else is unusable.
+HASH_ALGO = "sha256"
 
 
 def _is_ignored_file(name: str) -> bool:
@@ -105,7 +107,7 @@ class _Side:
 
 
 def hash_file(path: str) -> str:
-    digest = hashlib.sha256()
+    digest = hashlib.new(HASH_ALGO)
     with open(path, "rb") as fh:
         while chunk := fh.read(_HASH_CHUNK_BYTES):
             digest.update(chunk)
