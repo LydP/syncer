@@ -8,7 +8,16 @@ from dataclasses import dataclass, field
 from syncer.config import SyncRule, normalize_replica_path
 
 _IGNORED_DIR_NAMES = {".git", ".svn", ".hg", "__pycache__"}
-_IGNORED_FILE_PATTERNS = ("*.pyc", "~$*", "Thumbs.db", "desktop.ini", ".DS_Store")
+# "*.syncer-tmp-*": the executor's own overwrite temp files, orphaned only by a
+# crash mid-copy — never real replica content.
+_IGNORED_FILE_PATTERNS = (
+    "*.pyc",
+    "~$*",
+    "Thumbs.db",
+    "desktop.ini",
+    ".DS_Store",
+    "*.syncer-tmp-*",
+)
 # One precompiled alternation instead of a per-file sweep of fnmatch calls, each
 # of which re-normcases both arguments. Windows-only tool, so matching is always
 # case-insensitive (what fnmatch gave us via normcase anyway).
@@ -45,6 +54,17 @@ class FileChange:
     replica_size: int | None = None
     detail: str | None = None
     baseline_stale: bool = False
+
+    @property
+    def is_deletion(self) -> bool:
+        """True when the executor applies this change by removing the replica
+        file rather than copying master's content onto it: `master_deleted`,
+        or a `both_changed` promoted from it (master gone, replica edited)
+        whose resolution is "overwrite from master".
+        """
+        return self.category == "master_deleted" or (
+            self.category == "both_changed" and not self.master_present
+        )
 
 
 @dataclass(frozen=True)

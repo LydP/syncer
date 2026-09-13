@@ -1,7 +1,11 @@
 import os
+import shutil
+import stat
 import sys
 import tempfile
 import tomllib
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -86,17 +90,54 @@ def ensure_base_dir_writable(base_dir: Path) -> None:
         raise BaseDirNotWritableError(f"{base_dir} is not writable") from exc
 
 
-def atomic_write_bytes(path: Path, data: bytes) -> None:
-    """Write via `<name>.tmp` + `os.replace`, so a crash never leaves `path`
-    half-written; the temp file is removed if anything fails.
+def make_writable(path: Path | str) -> None:
+    """Clear the Windows read-only attribute, if set. `os.replace` and
+    `os.remove` both refuse a read-only target, and `shutil.copy2` carries a
+    read-only master's attribute onto every copy of it.
     """
-    tmp_path = path.with_name(path.name + ".tmp")
     try:
-        tmp_path.write_bytes(data)
-        os.replace(tmp_path, path)
+        mode = os.stat(path).st_mode
+    except OSError:
+        return
+    if not mode & stat.S_IWRITE:
+        os.chmod(path, mode | stat.S_IWRITE)
+
+
+def _atomic_replace(dst: Path, tmp_path: Path, write_tmp: Callable[[Path], object]) -> None:
+    """Fill `tmp_path` via `write_tmp`, then `os.replace` it onto `dst`, so a
+    crash never leaves `dst` half-written; the temp file is best-effort
+    removed if anything fails.
+    """
+    try:
+        write_tmp(tmp_path)
+        os.replace(tmp_path, dst)
     except BaseException:
-        tmp_path.unlink(missing_ok=True)
+        try:
+            make_writable(tmp_path)
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass  # best-effort only — never mask the original failure
         raise
+
+
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    _atomic_replace(path, path.with_name(path.name + ".tmp"), lambda tmp: tmp.write_bytes(data))
+
+
+def atomic_copy(src: Path | str, dst: Path) -> None:
+    """Copy `src` onto `dst` atomically.
+
+    A `.syncer-tmp-<uuid8>` suffix (rather than `atomic_write_bytes`'s plain
+    `.tmp`) avoids collisions when copies into the same directory could
+    overlap in time.
+    """
+    tmp_path = dst.with_name(f"{dst.name}.syncer-tmp-{uuid.uuid4().hex[:8]}")
+
+    def write_tmp(tmp: Path) -> None:
+        shutil.copy2(src, tmp)
+        make_writable(dst)  # a read-only dst would make os.replace fail
+
+    _atomic_replace(dst, tmp_path, write_tmp)
 
 
 def utc_file_stamp() -> str:

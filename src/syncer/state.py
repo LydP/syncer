@@ -1,5 +1,6 @@
 import json
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -139,23 +140,26 @@ def merge_replica_entries(
     updates: dict[str, BaselineEntry],
     *,
     now: datetime,
+    removed: Iterable[str] = (),
 ) -> State:
-    """Merge `updates` into one replica's `files` map, leaving every other
-    entry (and every other rule/replica) untouched, and bump `last_sync`.
+    """Merge `updates` into one replica's `files` map and drop the `removed`
+    rel_paths (files an applied `master_deleted` took off both sides, so a
+    stale baseline doesn't linger), leaving every other entry (and every
+    other rule/replica) untouched, and bump `last_sync`.
 
     A rel_path already present in the replica is fully overwritten by the
     incoming BaselineEntry, so an ordinary drift-sync (which never sets
     `kept`) clears any stale `kept=True` on that path simply by omitting it.
     rel_paths match case-insensitively (as `check()` looks them up), so an
-    update also replaces an existing entry differing only by case.
+    update or removal also hits an existing entry differing only by case.
     """
     rule = state.rules.get(rule_id, {})
     existing = rule.get(replica_path)
-    updated_keys = {os.path.normcase(rel_path) for rel_path in updates}
+    dropped_keys = {os.path.normcase(rel_path) for rel_path in (*updates, *removed)}
     kept_files = {
         rel_path: entry
         for rel_path, entry in (existing.files if existing else {}).items()
-        if os.path.normcase(rel_path) not in updated_keys
+        if os.path.normcase(rel_path) not in dropped_keys
     }
     new_replica = ReplicaState(
         last_sync=now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
