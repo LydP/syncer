@@ -134,6 +134,19 @@ def hash_file(path: str) -> str:
     return digest.hexdigest()
 
 
+def baseline_from_disk(path: str, *, kept: bool = False) -> BaselineEntry:
+    """A baseline entry recording `path`'s current bytes.
+
+    Always the *replica's* own file — that's what a future check() compares
+    against, whether the bytes got there by a copy from the master (sync.py)
+    or by the user keeping the replica's version (conflict.py). Size and mtime
+    must come from the same file as the hash: _entry_hash uses them as the
+    cache key for skipping a re-hash.
+    """
+    stat = os.stat(path)
+    return BaselineEntry(hash=hash_file(path), size=stat.st_size, mtime=stat.st_mtime, kept=kept)
+
+
 def _file_entry(rel_path: str, abs_path: str) -> _SideEntry:
     try:
         stat = os.stat(abs_path)

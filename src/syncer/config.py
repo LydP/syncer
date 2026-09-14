@@ -34,6 +34,18 @@ def normalize_replica_path(path: str) -> str:
     return os.path.normcase(os.path.normpath(os.path.abspath(path)))
 
 
+def abs_path(root: str, master_type: str, rel_path: str) -> str:
+    """The on-disk path of `rel_path` under a master or replica `root`.
+
+    A file-type master's one replica entry *is* the file — there's no root
+    folder to join a rel_path onto (mirrors check.py's _scan_side). Shared by
+    sync.py and conflict.py so this rule has a single owner.
+    """
+    if master_type == "file":
+        return root
+    return os.path.join(root, *rel_path.split("/"))
+
+
 @dataclass(frozen=True)
 class SyncRule:
     id: str

@@ -5,8 +5,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from syncer.check import BaselineEntry, FileChange, hash_file
-from syncer.config import SyncRule, normalize_replica_path
+from syncer.check import BaselineEntry, FileChange, baseline_from_disk
+from syncer.config import SyncRule, abs_path as _abs_path, normalize_replica_path
 from syncer.state import State, merge_replica_entries, save_state
 from syncer.storage import atomic_copy, make_writable, utc_file_stamp
 
@@ -27,14 +27,6 @@ class SyncResult:
     errors: list[FileError]
 
 
-def _abs_path(root: str, master_type: str, rel_path: str) -> str:
-    # A file-type master's one replica entry *is* the file — there's no root
-    # folder to join a rel_path onto (mirrors check.py's _scan_side).
-    if master_type == "file":
-        return root
-    return os.path.join(root, *rel_path.split("/"))
-
-
 def _copy_change(rule: SyncRule, replica_root: str, change: FileChange) -> BaselineEntry:
     master_abs = _abs_path(rule.master, rule.master_type, change.rel_path)
     replica_abs = _abs_path(replica_root, rule.master_type, change.rel_path)
@@ -43,10 +35,7 @@ def _copy_change(rule: SyncRule, replica_root: str, change: FileChange) -> Basel
         shutil.copy2(master_abs, replica_abs)
     else:
         atomic_copy(master_abs, Path(replica_abs))
-    # Hash/stat the replica's own now-copied bytes rather than the master's —
-    # that's what a future check() will actually compare against.
-    stat = os.stat(replica_abs)
-    return BaselineEntry(hash=hash_file(replica_abs), size=stat.st_size, mtime=stat.st_mtime)
+    return baseline_from_disk(replica_abs)
 
 
 def _prune_empty_parents(replica_key: str, start_dir: str) -> None:

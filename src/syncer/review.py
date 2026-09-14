@@ -47,6 +47,12 @@ CATEGORY_LABEL: dict[str, str] = {
 BUCKETS = ("safe", "delete", "conflict", "context")
 CHECKABLE_BUCKETS = frozenset({"safe", "delete"})
 
+# Derived from CATEGORY_BUCKET so the taxonomy keeps one owner. Tuples, not
+# sets, because both drive user-visible ordering (see BUCKETS).
+CONFLICT_CATEGORIES = tuple(c for c, bucket in CATEGORY_BUCKET.items() if bucket == "conflict")
+# no_baseline is always resolved per-file (spec.md §9) — never in bulk.
+BULK_CATEGORIES = tuple(c for c in CONFLICT_CATEGORIES if c != "no_baseline")
+
 
 class LeafKey(NamedTuple):
     """Identifies one leaf for selection purposes: a replica's normalised
@@ -88,6 +94,13 @@ class ReviewLeaf:
     @property
     def checkable(self) -> bool:
         return self.bucket in CHECKABLE_BUCKETS
+
+    @property
+    def resolvable(self) -> bool:
+        """Offers a per-file "Resolve" affordance instead of a tick box —
+        the other half of `checkable`, so the view never re-derives either
+        from `bucket` itself."""
+        return self.bucket == "conflict"
 
 
 @dataclass(frozen=True)

@@ -5,9 +5,10 @@ lives in `syncer.review` (pure, Qt-free, unit-tested). This module owns
 widgets and Qt signals and nothing else — it is not covered by the TDD loop,
 and is verified by running the app rather than by pytest.
 
-Out of scope here, per issue #6: the conflict-resolution dialog itself
-(issue #7 — the "Resolve conflicts" button only emits a signal a future host
-window connects to that dialog) and rule add/edit/delete (issue #8).
+Conflict resolution (issue #7) is wired in via `syncer.gui.conflict_dialog`:
+the "Resolve conflicts" button and each conflict leaf's "Resolve" cell open
+`ConflictDialog`; the replica branch's context menu offers the per-category
+bulk actions. Rule add/edit/delete (issue #8) stays out of scope.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSplitter,
@@ -36,7 +38,11 @@ from PySide6.QtWidgets import (
 
 from syncer.check import CheckResult, check
 from syncer.config import SyncRule
+from syncer.conflict import apply_keep_replica, bulk_candidates_by_category, conflict_queue
+from syncer.gui.conflict_dialog import ConflictDialog, bulk_overwrite
 from syncer.review import (
+    BULK_CATEGORIES,
+    CATEGORY_LABEL,
     LeafKey,
     ReviewLeaf,
     ReviewReplica,
@@ -154,6 +160,9 @@ class ReviewPane(QWidget):
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Replica / folder / file", "Change", ""])
         self.tree.itemChanged.connect(self._on_item_changed)
+        self.tree.itemClicked.connect(self._on_item_clicked)
+        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._show_tree_context_menu)
 
         self.status_label = QLabel("Not checked yet.")
         self.status_label.setWordWrap(True)
@@ -348,10 +357,14 @@ class ReviewPane(QWidget):
             if node.checkable:
                 item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             else:
-                item.setFlags(item.flags() & ~Qt.ItemIsUserCheckable & ~Qt.ItemIsEnabled)
+                # Greying is the brush's job, not ItemIsEnabled's: disabled
+                # items don't receive itemClicked, which a resolvable row
+                # needs. _apply_selection_to_tree leaves these alone, so no
+                # inert check indicator is painted either.
+                item.setFlags(item.flags() & ~Qt.ItemIsUserCheckable)
                 for column in (0, 1):
                     item.setForeground(column, QBrush(_GREY))
-                if node.bucket == "conflict":
+                if node.resolvable:
                     item.setText(2, "Resolve →")
         else:  # ReviewReplica or ReviewFolder
             if isinstance(node, ReviewReplica):
@@ -381,8 +394,11 @@ class ReviewPane(QWidget):
         with QSignalBlocker(self.tree):
             for item in self._iter_tree_items():
                 node = item.data(0, ROLE_NODE)
-                if node is not None:
-                    item.setCheckState(0, _CHECK_STATE[node_state(node, selected)])
+                # A non-checkable leaf has no tick to set — calling
+                # setCheckState on one paints an indicator that can't be used.
+                if node is None or (isinstance(node, ReviewLeaf) and not node.checkable):
+                    continue
+                item.setCheckState(0, _CHECK_STATE[node_state(node, selected)])
 
     def _expand_drifted(self) -> None:
         for item in self._iter_tree_items():
@@ -419,7 +435,9 @@ class ReviewPane(QWidget):
         self.btn_sync_all_safe.setText(f"Sync all safe changes ({counts['safe']})")
         self.btn_sync_all_safe.setEnabled(not blocked and counts["safe"] > 0)
         self.btn_resolve.setText(f"Resolve conflicts → ({counts['conflict']})")
-        self.btn_resolve.setEnabled(counts["conflict"] > 0)
+        # Blocked too: with the master missing every conflict is a both_changed
+        # whose "overwrite" is a deletion (spec.md §8's one-click-wipe guard).
+        self.btn_resolve.setEnabled(not blocked and counts["conflict"] > 0)
 
     def _unlock_current_rule(self) -> None:
         if self._current_rule_id is not None:
@@ -428,9 +446,105 @@ class ReviewPane(QWidget):
             self._show_rule(self._current_rule_id)
 
     def _request_conflict_resolution(self) -> None:
-        if self._current_rule_id is not None:
-            # Scoped to the rule; issue #7 owns per-replica queuing.
-            self.conflictsRequested.emit(self._current_rule_id, "")
+        current = self._current_review()
+        if current is not None and not self._is_blocked(*current):
+            self._open_conflict_dialog(current[0])
+
+    # -- conflict resolution (issue #7) -------------------------------------
+
+    def _on_item_clicked(self, item: QTreeWidgetItem, column: int) -> None:
+        if column != 2 or self._current_rule_id is None:
+            return
+        node = item.data(0, ROLE_NODE)
+        if isinstance(node, ReviewLeaf) and node.resolvable:
+            self._run_conflict_dialog(self._current_rule_id, [node])
+
+    def _open_conflict_dialog(self, rule_id: str, replica_path: str | None = None) -> None:
+        """Queues every conflict in the rule, or just one replica's when
+        `replica_path` is given."""
+        review_rule = self._review.get(rule_id)
+        if review_rule is None:
+            return
+        nodes = [
+            r
+            for r in review_rule.replicas
+            if replica_path is None or r.replica_path == replica_path
+        ]
+        queue = conflict_queue(nodes)
+        if queue:
+            self._run_conflict_dialog(rule_id, queue)
+
+    def _run_conflict_dialog(self, rule_id: str, queue: list[ReviewLeaf]) -> None:
+        rule = self._rules_by_id[rule_id]
+        dialog = ConflictDialog(rule, queue, self._state, self._state_path, self._logs_dir, self)
+        dialog.exec()
+        if not dialog.resolved_any:
+            return  # closed or skipped through — nothing on disk changed
+        self._state = dialog.state
+        self._queue_check(rule_id)
+
+    def _show_tree_context_menu(self, pos) -> None:
+        item = self.tree.itemAt(pos)
+        rule_id = self._current_rule_id
+        if item is None or rule_id is None:
+            return
+        node = item.data(0, ROLE_NODE)
+        if not isinstance(node, ReviewReplica):
+            return
+        # Bind the path, not the node: a lambda closing over `node` would pin
+        # this whole replica subtree alive for as long as the menu's actions.
+        replica_path = node.replica_path
+        by_category = bulk_candidates_by_category([node])
+        menu = QMenu(self)
+        # Deleted with the menu rather than living on as a child of the pane.
+        menu.setAttribute(Qt.WA_DeleteOnClose)
+        # Per-replica queue entry point (spec.md §9).
+        n_conflicts = len(conflict_queue([node]))
+        if n_conflicts:
+            action = menu.addAction(f"Resolve conflicts ({n_conflicts})")
+            action.triggered.connect(
+                lambda checked=False: self._open_conflict_dialog(rule_id, replica_path)
+            )
+            menu.addSeparator()
+        for category in BULK_CATEGORIES:
+            candidates = by_category.get(category)
+            if not candidates:
+                continue
+            label = CATEGORY_LABEL[category]
+            for verb, handler in (
+                ("Keep all as-is", self._bulk_keep),
+                ("Overwrite all from master", self._bulk_overwrite),
+            ):
+                action = menu.addAction(f"{verb} — {label} ({len(candidates)})")
+                action.triggered.connect(
+                    lambda checked=False, h=handler, c=candidates: h(rule_id, replica_path, c)
+                )
+        if menu.isEmpty():
+            menu.close()
+            return
+        menu.exec(self.tree.viewport().mapToGlobal(pos))
+
+    def _bulk_keep(self, rule_id: str, replica_path: str, changes) -> None:
+        rule = self._rules_by_id[rule_id]
+        try:
+            self._state = apply_keep_replica(
+                rule, replica_path, changes, self._state, self._state_path
+            )
+        except OSError as exc:
+            # Nothing is merged or saved unless every file could be read.
+            QMessageBox.warning(self, "Couldn't keep replica versions", str(exc))
+            return
+        self._queue_check(rule_id)
+
+    def _bulk_overwrite(self, rule_id: str, replica_path: str, changes) -> None:
+        rule = self._rules_by_id[rule_id]
+        new_state = bulk_overwrite(
+            self, rule, replica_path, changes, self._state, self._state_path, self._logs_dir
+        )
+        if new_state is None:
+            return  # cancelled at the confirm prompt — nothing applied
+        self._state = new_state
+        self._queue_check(rule_id)
 
     def _sync_all_safe(self) -> None:
         current = self._current_review()

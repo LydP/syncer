@@ -43,6 +43,17 @@ The conflict where both the master and a replica were edited since the last sync
 A drift the tool cannot apply on its own: divergence, changed on both sides, or a no-baseline mismatch. Requires the user to resolve it; never touched by "sync all safe changes."
 _Avoid_: divergence (only one of the three conflict cases)
 
+**Conflict queue**:
+The ordered list of a replica's (or a whole rule's) unresolved conflicts that a "Resolve conflicts" dialog steps through one at a time, in the same order as the review tree.
+_Avoid_: queue (alone — ambiguous outside the resolve-conflicts context)
+
+**Conflict view**:
+Everything shown to the user when resolving a single conflicted file: one or two content diffs (or the reason each isn't available) plus any explanatory note. Built fresh each time the conflict queue lands on a file.
+
+**Content diff**:
+The line-by-line comparison between two versions of one file's text, shown inside a conflict view to help the user decide how to resolve it. Distinct from Check, which reports only which files drifted, never their line-level content.
+_Avoid_: diff (bare "diff" collides with Check's own _Avoid_ entry — always say "content diff" so it isn't mistaken for the check operation)
+
 **Resolve**:
 The user's decision on a conflicted file: overwrite it from master, skip it for now, or keep the replica's version. The conflict counterpart to sync — sync applies safe drift, resolving settles a conflict, and resolving may choose not to apply master's version at all.
 
