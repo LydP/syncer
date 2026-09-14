@@ -28,6 +28,7 @@ CATEGORY_BUCKET: dict[str, str] = {
     "in_sync": "context",
     "replica_only": "context",
     "unreadable": "context",
+    "kept": "context",
 }
 
 # Plain-text labels only — no glyphs (spec.md §5/§7: "the user does not want
@@ -42,6 +43,7 @@ CATEGORY_LABEL: dict[str, str] = {
     "master_deleted": "Deleted from master",
     "replica_only": "Only in the replica",
     "unreadable": "Couldn't read this file",
+    "kept": "Kept replica's version",
 }
 
 BUCKETS = ("safe", "delete", "conflict", "context")

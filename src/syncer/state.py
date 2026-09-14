@@ -41,6 +41,7 @@ def _parse_file_entry(raw: dict) -> BaselineEntry:
         size=raw["size"],
         mtime=raw["mtime"],
         kept=raw.get("kept", False),
+        kept_master_hash=raw.get("kept_master_hash"),
     )
 
 
@@ -101,6 +102,8 @@ def _file_entry_to_dict(entry: BaselineEntry) -> dict:
     raw = {"hash": entry.hash, "size": entry.size, "mtime": entry.mtime}
     if entry.kept:
         raw["kept"] = True
+        if entry.kept_master_hash is not None:
+            raw["kept_master_hash"] = entry.kept_master_hash
     return raw
 
 

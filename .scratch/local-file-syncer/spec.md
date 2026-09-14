@@ -156,6 +156,7 @@ Internal `category` is a stable enum; the UI renders the plain-text label only �
 | `master_deleted` | in B, not in M, R present | Deleted from master | master-deleted (own confirm) |
 | `replica_only` | in R, not in M, not in B | Only in the replica | informational only, never checkable/auto-deleted |
 | `unreadable` | IO/permission error, or a file/dir type mismatch at the same path | Couldn't read this file | none — display only, never checkable |
+| `kept` | B is `kept`, M == B's `kept_master_hash`, R == B's `hash` | Kept replica's version | none — display only, never checkable |
 
 Edge cases:
 - **Locally-deleted replica file** (in B and M, absent from R) → `new`. Master wins uncontested;
@@ -165,6 +166,11 @@ Edge cases:
 - **`converged`** reports as `in_sync` with an internal `baseline_stale` flag; the stale-but-equal
   entry is refreshed opportunistically the next time that replica syncs (even though the copy
   no-ops).
+- **`kept`** entries compare each side against its own hash from keep time — M against
+  `kept_master_hash` (absent master at keep time recorded as `None`), R against `hash` — rather
+  than the ordinary M/R-vs-B rules. The moment M moves past its kept-time hash, the file re-enters
+  ordinary drift (`changed`, safe drift): master wins, so no conflict is re-raised just because the
+  user once chose to keep the replica.
 
 ### Return structure
 

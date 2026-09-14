@@ -190,6 +190,62 @@ def test_save_state_then_load_state_round_trips(layout):
     assert result.state == state
 
 
+def test_save_state_then_load_state_round_trips_kept_master_hash(layout):
+    state = _state(
+        {
+            "rule-1": {
+                "replica-a": ReplicaState(
+                    last_sync="2026-09-09T14:32:00Z",
+                    files={
+                        "a.txt": BaselineEntry(
+                            hash="h1", size=1, mtime=1.0, kept=True, kept_master_hash="m1"
+                        )
+                    },
+                )
+            }
+        }
+    )
+
+    save_state(layout.state_path, state)
+    result = load_state(layout.state_path)
+
+    assert result.state == state
+
+
+def test_load_state_kept_entry_without_kept_master_hash_defaults_to_none(layout):
+    layout.state_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "hash_algo": "sha256",
+                "rules": {
+                    "rule-1": {
+                        "replicas": {
+                            "replica-a": {
+                                "last_sync": "2026-09-09T14:32:00Z",
+                                "files": {
+                                    "a.txt": {
+                                        "hash": "h1",
+                                        "size": 1,
+                                        "mtime": 1.0,
+                                        "kept": True,
+                                    }
+                                },
+                            }
+                        }
+                    }
+                },
+            }
+        )
+    )
+
+    result = load_state(layout.state_path)
+
+    assert result.warning is None
+    entry = result.state.rules["rule-1"]["replica-a"].files["a.txt"]
+    assert entry == BaselineEntry(hash="h1", size=1, mtime=1.0, kept=True, kept_master_hash=None)
+
+
 def test_merge_replica_entries_creates_new_rule_and_replica():
     state = _state({})
 

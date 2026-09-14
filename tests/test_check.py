@@ -3,7 +3,7 @@ import os
 import pytest
 
 import syncer.check as check_module
-from syncer.check import BaselineEntry, check, hash_file
+from syncer.check import BaselineEntry, baseline_from_disk, check, hash_file
 from syncer.config import SyncRule, normalize_replica_path
 
 # Any digest that can't match real content, for exercising a stale baseline.
@@ -20,6 +20,15 @@ def _symlink(target, link):
 def _baseline_entry_for(path):
     stat = os.stat(path)
     return BaselineEntry(hash=hash_file(str(path)), size=stat.st_size, mtime=stat.st_mtime)
+
+
+def _kept_entry_for(replica_path, master_path=None):
+    """A `kept` baseline entry as `apply_keep_replica` would write it:
+    hash/size/mtime from the replica's current bytes, `kept_master_hash`
+    from the master's current bytes (None if `master_path` doesn't exist).
+    """
+    master_hash = hash_file(str(master_path)) if master_path and os.path.isfile(master_path) else None
+    return baseline_from_disk(str(replica_path), kept=True, kept_master_hash=master_hash)
 
 
 def _baseline(replica, entries):
@@ -172,6 +181,143 @@ def test_replica_file_locally_deleted_but_master_and_baseline_agree_is_new(maste
     change = _only_change(check(_rule(master, [replica]), baseline=baseline))
 
     assert change.category == "new"
+
+
+def test_kept_entry_unchanged_on_both_sides_is_kept(master_and_replica):
+    master, replica = master_and_replica
+    (master / "a.txt").write_text("master content")
+    (replica / "a.txt").write_text("kept replica content")
+    baseline = _baseline(replica, {"a.txt": _kept_entry_for(replica / "a.txt", master / "a.txt")})
+
+    change = _only_change(check(_rule(master, [replica]), baseline=baseline))
+
+    assert change.category == "kept"
+
+
+def test_kept_entry_with_master_changed_since_keep_is_changed(master_and_replica):
+    master, replica = master_and_replica
+    (master / "a.txt").write_text("master content")
+    (replica / "a.txt").write_text("kept replica content")
+    baseline = _baseline(replica, {"a.txt": _kept_entry_for(replica / "a.txt", master / "a.txt")})
+    (master / "a.txt").write_text("master content, edited after the keep")
+
+    change = _only_change(check(_rule(master, [replica]), baseline=baseline))
+
+    assert change.category == "changed"
+
+
+def test_kept_entry_with_replica_changed_since_keep_is_diverged(master_and_replica):
+    master, replica = master_and_replica
+    (master / "a.txt").write_text("master content")
+    (replica / "a.txt").write_text("kept replica content")
+    baseline = _baseline(replica, {"a.txt": _kept_entry_for(replica / "a.txt", master / "a.txt")})
+    (replica / "a.txt").write_text("kept replica content, edited again")
+
+    change = _only_change(check(_rule(master, [replica]), baseline=baseline))
+
+    assert change.category == "diverged"
+
+
+def test_kept_entry_with_both_changed_since_keep_is_both_changed(master_and_replica):
+    master, replica = master_and_replica
+    (master / "a.txt").write_text("master content")
+    (replica / "a.txt").write_text("kept replica content")
+    baseline = _baseline(replica, {"a.txt": _kept_entry_for(replica / "a.txt", master / "a.txt")})
+    (master / "a.txt").write_text("master content, edited after the keep")
+    (replica / "a.txt").write_text("kept replica content, edited again")
+
+    change = _only_change(check(_rule(master, [replica]), baseline=baseline))
+
+    assert change.category == "both_changed"
+
+
+def test_kept_entry_whose_master_was_absent_and_stays_absent_is_kept(master_and_replica):
+    master, replica = master_and_replica
+    (replica / "a.txt").write_text("kept replica content")
+    baseline = _baseline(replica, {"a.txt": _kept_entry_for(replica / "a.txt")})
+
+    change = _only_change(check(_rule(master, [replica]), baseline=baseline))
+
+    assert change.category == "kept"
+
+
+def test_kept_entry_whose_master_stays_absent_and_replica_edited_again_is_diverged(
+    master_and_replica,
+):
+    master, replica = master_and_replica
+    (replica / "a.txt").write_text("kept replica content")
+    baseline = _baseline(replica, {"a.txt": _kept_entry_for(replica / "a.txt")})
+    (replica / "a.txt").write_text("kept replica content, edited again")
+
+    change = _only_change(check(_rule(master, [replica]), baseline=baseline))
+
+    assert change.category == "diverged"
+    # No master copy to overwrite from: "overwrite from master" must delete.
+    assert change.is_deletion
+
+
+def test_kept_entry_whose_absent_master_reappears_unchanged_replica_is_changed(
+    master_and_replica,
+):
+    master, replica = master_and_replica
+    (replica / "a.txt").write_text("kept replica content")
+    baseline = _baseline(replica, {"a.txt": _kept_entry_for(replica / "a.txt")})
+    (master / "a.txt").write_text("master reappeared")
+
+    change = _only_change(check(_rule(master, [replica]), baseline=baseline))
+
+    assert change.category == "changed"
+
+
+def test_kept_entry_whose_present_master_is_later_deleted_with_replica_unchanged_is_master_deleted(
+    master_and_replica,
+):
+    master, replica = master_and_replica
+    (master / "a.txt").write_text("master content")
+    (replica / "a.txt").write_text("kept replica content")
+    baseline = _baseline(replica, {"a.txt": _kept_entry_for(replica / "a.txt", master / "a.txt")})
+    (master / "a.txt").unlink()
+
+    change = _only_change(check(_rule(master, [replica]), baseline=baseline))
+
+    assert change.category == "master_deleted"
+
+
+def test_kept_entry_whose_present_master_is_later_deleted_with_replica_edited_is_both_changed(
+    master_and_replica,
+):
+    master, replica = master_and_replica
+    (master / "a.txt").write_text("master content")
+    (replica / "a.txt").write_text("kept replica content")
+    baseline = _baseline(replica, {"a.txt": _kept_entry_for(replica / "a.txt", master / "a.txt")})
+    (master / "a.txt").unlink()
+    (replica / "a.txt").write_text("kept replica content, edited again")
+
+    change = _only_change(check(_rule(master, [replica]), baseline=baseline))
+
+    assert change.category == "both_changed"
+
+
+def test_kept_entry_masters_stat_coincidentally_matching_baseline_still_detects_change(
+    master_and_replica,
+):
+    master, replica = master_and_replica
+    (master / "a.txt").write_text("master content")
+    (replica / "a.txt").write_text("kept replica content")
+    kept_entry = _kept_entry_for(replica / "a.txt", master / "a.txt")
+    # Same byte size as the replica's kept content but different bytes, so a
+    # stat-only shortcut (reusing the kept entry's replica-derived size for
+    # the master) would wrongly call this unchanged.
+    (master / "a.txt").write_text("x" * kept_entry.size)
+    # Force the master's current mtime to coincidentally match the kept
+    # entry's stored mtime too, which belongs to the *replica's* file.
+    os.utime(master / "a.txt", (kept_entry.mtime, kept_entry.mtime))
+    assert (master / "a.txt").stat().st_size == kept_entry.size
+    baseline = _baseline(replica, {"a.txt": kept_entry})
+
+    change = _only_change(check(_rule(master, [replica]), baseline=baseline))
+
+    assert change.category == "changed"
 
 
 def test_missing_replica_reports_every_master_file_as_new(tmp_path):

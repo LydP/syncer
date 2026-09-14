@@ -102,6 +102,7 @@ def test_folder_paths_differing_only_by_case_share_one_folder_node():
         ("in_sync", "context"),
         ("replica_only", "context"),
         ("unreadable", "context"),
+        ("kept", "context"),
     ],
 )
 def test_each_category_maps_to_its_spec_action_bucket(category, expected_bucket):

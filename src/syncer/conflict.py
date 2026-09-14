@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from syncer.check import FileChange, baseline_from_disk
+from syncer.check import FileChange, baseline_from_disk, hash_file
 from syncer.config import SyncRule, abs_path, normalize_replica_path
 from syncer.review import BULK_CATEGORIES, ReviewLeaf, ReviewNode, ReviewReplica, iter_leaves
 from syncer.state import State, merge_replica_entries, save_state
@@ -176,12 +176,14 @@ def apply_keep_replica(
     """
     if not changes:
         return state
-    updates = {
-        change.rel_path: baseline_from_disk(
-            abs_path(replica_root, rule.master_type, change.rel_path), kept=True
+    updates = {}
+    for change in changes:
+        master_abs = abs_path(rule.master, rule.master_type, change.rel_path)
+        updates[change.rel_path] = baseline_from_disk(
+            abs_path(replica_root, rule.master_type, change.rel_path),
+            kept=True,
+            kept_master_hash=hash_file(master_abs) if os.path.isfile(master_abs) else None,
         )
-        for change in changes
-    }
     new_state = merge_replica_entries(
         state,
         rule.id,

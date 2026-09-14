@@ -41,6 +41,9 @@ class BaselineEntry:
     size: int
     mtime: float
     kept: bool = False
+    # The master's hash at keep time; None if the master was absent then.
+    # Only meaningful when kept is True.
+    kept_master_hash: str | None = None
 
 
 @dataclass(frozen=True)
@@ -59,11 +62,13 @@ class FileChange:
     def is_deletion(self) -> bool:
         """True when the executor applies this change by removing the replica
         file rather than copying master's content onto it: `master_deleted`,
-        or a `both_changed` promoted from it (master gone, replica edited)
-        whose resolution is "overwrite from master".
+        or a conflict with no master copy to overwrite from — a `both_changed`
+        promoted from it (master gone, replica edited), or a `diverged` kept
+        entry whose master was already absent at keep time — whose resolution
+        is "overwrite from master".
         """
         return self.category == "master_deleted" or (
-            self.category == "both_changed" and not self.master_present
+            self.category in ("both_changed", "diverged") and not self.master_present
         )
 
 
@@ -134,7 +139,9 @@ def hash_file(path: str) -> str:
     return digest.hexdigest()
 
 
-def baseline_from_disk(path: str, *, kept: bool = False) -> BaselineEntry:
+def baseline_from_disk(
+    path: str, *, kept: bool = False, kept_master_hash: str | None = None
+) -> BaselineEntry:
     """A baseline entry recording `path`'s current bytes.
 
     Always the *replica's* own file — that's what a future check() compares
@@ -144,7 +151,13 @@ def baseline_from_disk(path: str, *, kept: bool = False) -> BaselineEntry:
     cache key for skipping a re-hash.
     """
     stat = os.stat(path)
-    return BaselineEntry(hash=hash_file(path), size=stat.st_size, mtime=stat.st_mtime, kept=kept)
+    return BaselineEntry(
+        hash=hash_file(path),
+        size=stat.st_size,
+        mtime=stat.st_mtime,
+        kept=kept,
+        kept_master_hash=kept_master_hash,
+    )
 
 
 def _file_entry(rel_path: str, abs_path: str) -> _SideEntry:
@@ -263,9 +276,23 @@ def _entry_hash(
     return digest
 
 
-# Keyed by (replica matches baseline, master matches baseline); equal-to-both is
-# unreachable here because the two sides are already known to differ.
-_DIVERGENCE_BY_BASELINE_MATCH = {(True, False): "changed", (False, True): "diverged"}
+# Keyed by (replica matches its baseline hash, master matches its baseline hash).
+# For an ordinary entry both sides share `hash`, so (True, True) is unreachable
+# once the sides are known to differ; only a `kept` entry lands there.
+_CATEGORY_BY_BASELINE_MATCH = {
+    (True, True): "kept",
+    (True, False): "changed",
+    (False, True): "diverged",
+    (False, False): "both_changed",
+}
+
+
+def _master_baseline_hash(baseline_entry: BaselineEntry) -> str | None:
+    """What the master is compared against (spec.md §9): a `kept` entry's
+    master against its own hash from keep time (None if absent then), since
+    `hash` is the replica's kept content.
+    """
+    return baseline_entry.kept_master_hash if baseline_entry.kept else baseline_entry.hash
 
 
 def _categorize_present_both(
@@ -278,9 +305,9 @@ def _categorize_present_both(
     if baseline_entry is None:
         return "no_baseline", False
     return (
-        _DIVERGENCE_BY_BASELINE_MATCH.get(
-            (replica_hash == baseline_hash, master_hash == baseline_hash), "both_changed"
-        ),
+        _CATEGORY_BY_BASELINE_MATCH[
+            (replica_hash == baseline_hash, master_hash == _master_baseline_hash(baseline_entry))
+        ],
         False,
     )
 
@@ -351,7 +378,10 @@ def _check_replica(
             detail = "type mismatch: a file on one side, a folder on the other"
         elif master_present and replica_present:
             try:
-                master_hash = _entry_hash(master, baseline_entry, master_hashes)
+                # A kept entry's size/mtime are the replica's own, from keep
+                # time - never a valid stat shortcut for the master's hash.
+                master_baseline = None if baseline_entry and baseline_entry.kept else baseline_entry
+                master_hash = _entry_hash(master, master_baseline, master_hashes)
                 replica_hash = _entry_hash(replica, baseline_entry)
             except OSError as exc:
                 category = "unreadable"
@@ -369,9 +399,16 @@ def _check_replica(
                 category = "unreadable"
                 detail = str(exc)
             else:
-                category = (
-                    "master_deleted" if replica_hash == baseline_entry.hash else "both_changed"
-                )
+                # An absent master matches only a kept-while-absent baseline;
+                # otherwise it has "changed" by being deleted.
+                category = _CATEGORY_BY_BASELINE_MATCH[
+                    (
+                        replica_hash == baseline_entry.hash,
+                        _master_baseline_hash(baseline_entry) is None,
+                    )
+                ]
+                if category == "changed":
+                    category = "master_deleted"
         elif replica_present:
             category = "replica_only"
         else:

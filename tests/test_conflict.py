@@ -246,3 +246,30 @@ def test_keep_replica_version_leaves_other_files_and_replicas_untouched(master_a
 
     assert new_state.rules["r1"][replica_key].files["b.txt"] == untouched_entry
     assert new_state.rules["r1"][other_replica_key].files["c.txt"] == untouched_entry
+
+
+def test_keep_replica_version_records_masters_hash_at_keep_time(master_and_replica, layout):
+    master, replica = master_and_replica
+    (master / "a.txt").write_text("master content")
+    (replica / "a.txt").write_text("replica content")
+    rule = _rule(master, [replica])
+    change = _change("a.txt", "diverged")
+
+    new_state = apply_keep_replica(rule, str(replica), [change], EMPTY_STATE, layout.state_path)
+
+    entry = new_state.rules["r1"][normalize_replica_path(str(replica))].files["a.txt"]
+    assert entry.kept_master_hash == hash_file(str(master / "a.txt"))
+
+
+def test_keep_replica_version_with_master_absent_records_none_master_hash(
+    master_and_replica, layout
+):
+    master, replica = master_and_replica
+    (replica / "a.txt").write_text("replica content")
+    rule = _rule(master, [replica])
+    change = _change("a.txt", "both_changed", master_present=False)
+
+    new_state = apply_keep_replica(rule, str(replica), [change], EMPTY_STATE, layout.state_path)
+
+    entry = new_state.rules["r1"][normalize_replica_path(str(replica))].files["a.txt"]
+    assert entry.kept_master_hash is None
