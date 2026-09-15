@@ -89,7 +89,15 @@ def test_both_changed_falls_back_to_metadata_only_baseline_panels(master_and_rep
     (master / "a.txt").write_text("master content")
     (replica / "a.txt").write_text("replica content")
     rule = _rule(master, [replica])
-    change = _change("a.txt", "both_changed")
+    change = FileChange(
+        rel_path="a.txt",
+        category="both_changed",
+        master_present=True,
+        replica_present=True,
+        baseline_present=True,
+        baseline_size=1234,
+        baseline_mtime=5678.0,
+    )
 
     view = build_conflict_view(rule, str(replica), change)
 
@@ -105,6 +113,12 @@ def test_both_changed_falls_back_to_metadata_only_baseline_panels(master_and_rep
     assert replica_panel.unavailable_reason == master_panel.unavailable_reason
     assert replica_panel.right_meta.exists
     assert replica_panel.right_meta.size == len("replica content")
+
+    # The baseline side shows the stat stored with the baseline entry.
+    for panel in (master_panel, replica_panel):
+        assert panel.left_meta.exists is True
+        assert panel.left_meta.size == 1234
+        assert panel.left_meta.mtime == 5678.0
 
 
 def test_both_changed_with_master_deleted_shows_master_absent(master_and_replica):

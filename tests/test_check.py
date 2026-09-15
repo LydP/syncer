@@ -622,6 +622,23 @@ def test_file_change_reports_master_and_replica_sizes(master_and_replica):
     assert changes_by_path["only_master.txt"].replica_size is None
 
 
+def test_file_change_reports_baseline_size_and_mtime(master_and_replica):
+    master, replica = master_and_replica
+    (master / "a.txt").write_text("master content")
+    (replica / "a.txt").write_text("replica content")
+    (master / "b.txt").write_text("new")
+    baseline = _baseline(replica, {"A.TXT": BaselineEntry(hash="deadbeef", size=1234, mtime=5678.0)})
+
+    result = check(_rule(master, [replica]), baseline=baseline)
+
+    [replica_result] = result.replicas
+    changes_by_path = {c.rel_path: c for c in replica_result.files}
+    assert changes_by_path["a.txt"].baseline_size == 1234
+    assert changes_by_path["a.txt"].baseline_mtime == 5678.0
+    assert changes_by_path["b.txt"].baseline_size is None
+    assert changes_by_path["b.txt"].baseline_mtime is None
+
+
 def test_missing_master_directory_sets_master_missing_flag(tmp_path):
     master = tmp_path / "master"  # never created
     replica = tmp_path / "replica"

@@ -233,16 +233,20 @@ def build_conflict_view(rule: SyncRule, replica_root: str, change: FileChange) -
     replica_abs = abs_path(replica_root, rule.master_type, change.rel_path)
 
     if change.category == "both_changed":
-        # Neither side can be diffed against a baseline whose content was
-        # never stored, so both panels are metadata-only — _stat_meta already
-        # reports a missing file as exists=False, on either side.
-        empty_meta = FileMeta(exists=False)
+        # Neither side can be diffed against the baseline: its content was
+        # never stored, only its hash and stat — so both panels are
+        # metadata-only, with the baseline side showing that stored stat.
+        baseline_meta = FileMeta(
+            exists=change.baseline_present,
+            size=change.baseline_size,
+            mtime=change.baseline_mtime,
+        )
         panels = tuple(
             DiffPanel(
                 f"{label} vs. baseline",
                 "Baseline",
                 label,
-                empty_meta,
+                baseline_meta,
                 _stat_meta(path),
                 None,
                 _NO_BASELINE_CONTENT_REASON,

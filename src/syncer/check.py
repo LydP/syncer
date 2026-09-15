@@ -55,6 +55,8 @@ class FileChange:
     baseline_present: bool
     master_size: int | None = None
     replica_size: int | None = None
+    baseline_size: int | None = None
+    baseline_mtime: float | None = None
     detail: str | None = None
     baseline_stale: bool = False
 
@@ -428,6 +430,8 @@ def _check_replica(
                 detail=detail,
                 master_size=master.size if master_present else None,
                 replica_size=replica.size if replica_present else None,
+                baseline_size=baseline_entry.size if baseline_entry is not None else None,
+                baseline_mtime=baseline_entry.mtime if baseline_entry is not None else None,
             )
         )
     return ReplicaCheckResult(
