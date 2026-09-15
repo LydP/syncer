@@ -21,8 +21,13 @@ from syncer.review import BULK_CATEGORIES, ReviewLeaf, ReviewNode, ReviewReplica
 from syncer.state import State, merge_replica_entries, save_state
 
 # Above this, a text file falls back to metadata-only (spec.md §9: "a text
-# file over a size threshold" — no best-effort diff attempted).
-MAX_DIFF_BYTES = 1_000_000
+# file over a size threshold" — no best-effort diff attempted). Lowered from
+# 1 MB alongside issue #10, but the autojunk flip in _diff_ops is what fixes
+# that issue's shape (0.003 s even at 1 MB); this cap only guards shapes
+# autojunk can't help, where shared lines are too rare to be junked. Its cost:
+# 250 KB–1 MB text files get metadata only. Bytes are a loose proxy — matcher
+# cost tracks line count, not file size, so this bounds neither tightly.
+MAX_DIFF_BYTES = 250_000
 
 _BINARY_SNIFF_BYTES = 8192
 
@@ -77,12 +82,12 @@ def _read_lines_or_reason(path: str, meta: FileMeta) -> tuple[list[str] | None, 
         return None, f"File too large for a content diff (over {MAX_DIFF_BYTES:,} bytes)."
     try:
         with open(path, "rb") as fh:
-            # Sniff before reading the rest: a binary file is rejected on its
-            # first chunk rather than pulled wholly into memory and discarded.
-            head = fh.read(_BINARY_SNIFF_BYTES)
-            if b"\0" in head:
-                return None, _BINARY_REASON
-            raw = head + fh.read()
+            # One read, one allocation: the size check above caps this at
+            # MAX_DIFF_BYTES, so reading whole and slicing the sniff window
+            # beats concatenating a head chunk onto the rest.
+            raw = fh.read()
+        if b"\0" in raw[:_BINARY_SNIFF_BYTES]:
+            return None, _BINARY_REASON
     except OSError as exc:
         return None, f"Couldn't read file: {exc}"
     try:
@@ -93,11 +98,39 @@ def _read_lines_or_reason(path: str, meta: FileMeta) -> tuple[list[str] | None, 
 
 
 def _diff_ops(left_lines: list[str], right_lines: list[str]) -> tuple[DiffOp, ...]:
-    matcher = difflib.SequenceMatcher(a=left_lines, b=right_lines, autojunk=False)
-    return tuple(
-        DiffOp(tag, tuple(left_lines[i1:i2]), tuple(right_lines[j1:j2]))
+    # Flipped from autojunk=False for issue #10: without it, a heavily
+    # edited prose file whose two sides share only their blank lines diffs
+    # cubically (4.2 s at 91 KB — this file's own test fixture). autojunk
+    # drops lines filling >1% of the right side — blank lines in prose —
+    # from the match search. Popular lines never anchor a match, so the diff
+    # coarsens: on heavily edited prose the whole file comes back as one
+    # "replace", and in a repetitive file (few distinct lines, e.g. data or
+    # checklists) every popular line after an edit can show as changed.
+    # Trimming the common prefix/suffix first keeps a localized edit's
+    # untouched head and tail "equal" regardless of autojunk.
+    limit = min(len(left_lines), len(right_lines))
+    prefix = 0
+    while prefix < limit and left_lines[prefix] == right_lines[prefix]:
+        prefix += 1
+    suffix = 0
+    while suffix < limit - prefix and left_lines[-1 - suffix] == right_lines[-1 - suffix]:
+        suffix += 1
+    left_mid = left_lines[prefix : len(left_lines) - suffix]
+    right_mid = right_lines[prefix : len(right_lines) - suffix]
+
+    ops: list[DiffOp] = []
+    if prefix:
+        ops.append(DiffOp("equal", tuple(left_lines[:prefix]), tuple(right_lines[:prefix])))
+    matcher = difflib.SequenceMatcher(a=left_mid, b=right_mid, autojunk=True)
+    ops.extend(
+        DiffOp(tag, tuple(left_mid[i1:i2]), tuple(right_mid[j1:j2]))
         for tag, i1, i2, j1, j2 in matcher.get_opcodes()
     )
+    if suffix:
+        ops.append(
+            DiffOp("equal", tuple(left_lines[-suffix:]), tuple(right_lines[-suffix:]))
+        )
+    return tuple(ops)
 
 
 _NO_BASELINE_CONTENT_REASON = (

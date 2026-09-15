@@ -1,6 +1,9 @@
+import time
+
 from syncer.check import BaselineEntry, CheckResult, FileChange, ReplicaCheckResult, hash_file
 from syncer.config import SyncRule, normalize_replica_path
 from syncer.conflict import (
+    MAX_DIFF_BYTES,
     apply_keep_replica,
     build_conflict_view,
     bulk_candidates_by_category,
@@ -52,6 +55,14 @@ def _review_rule(*replicas):
             replicas=[_replica_result(path, cats) for path, cats in replicas],
         )
     )
+
+
+def _heavily_rewritten_markdown(prefix):
+    """~90 KB of prose paragraphs where `prefix` ("master"/"replica") makes
+    every non-blank line unique to that side, leaving blank lines as the only
+    lines the two sides share — issue #10's pathological case."""
+    paragraphs = [" ".join(f"{prefix}{i}-{w}" for w in range(15)) for i in range(500)]
+    return "\n\n".join(paragraphs) + "\n"
 
 
 # -- diff panels per category ------------------------------------------------
@@ -159,6 +170,51 @@ def test_no_baseline_with_oversized_text_falls_back_to_metadata_only(master_and_
     [panel] = view.panels
     assert panel.ops is None
     assert "too large" in panel.unavailable_reason.lower()
+
+
+def test_heavily_rewritten_markdown_content_diff_stays_within_a_tight_time_budget(
+    master_and_replica,
+):
+    master, replica = master_and_replica
+    master_text = _heavily_rewritten_markdown("master")
+    replica_text = _heavily_rewritten_markdown("replica")
+    # Big enough to be a real workload, but under the cutoff, so this
+    # exercises _diff_ops rather than the metadata-only fallback.
+    assert 90_000 < len(master_text.encode("utf-8")) < MAX_DIFF_BYTES
+    (master / "a.md").write_text(master_text)
+    (replica / "a.md").write_text(replica_text)
+    rule = _rule(master, [replica])
+    change = _change("a.md", "diverged")
+
+    start = time.perf_counter()
+    view = build_conflict_view(rule, str(replica), change)
+    elapsed = time.perf_counter() - start
+
+    [panel] = view.panels
+    assert panel.ops is not None
+    # 0.25 s: ~12x over the observed runtime, but ~17x under the 4.2 s the
+    # un-flipped autojunk=False costs, so a slow CI box still catches it.
+    assert elapsed < 0.25
+    # autojunk collapses this input to a single whole-file replace; pinning
+    # it keeps the fidelity trade visible rather than only timing-dependent.
+    assert [op.tag for op in panel.ops] == ["replace"]
+
+
+def test_single_line_edit_in_repetitive_file_diffs_as_one_changed_line(master_and_replica):
+    master, replica = master_and_replica
+    # Few distinct lines, so every line is "popular" to autojunk.
+    lines = [f"v{i % 20}" for i in range(1000)]
+    (master / "a.csv").write_text("\n".join(lines) + "\n")
+    lines[500] = "edited"
+    (replica / "a.csv").write_text("\n".join(lines) + "\n")
+    rule = _rule(master, [replica])
+    change = _change("a.csv", "no_baseline", baseline_present=False)
+
+    view = build_conflict_view(rule, str(replica), change)
+
+    [panel] = view.panels
+    changed = [op for op in panel.ops if op.tag != "equal"]
+    assert [(len(op.left), len(op.right)) for op in changed] == [(1, 1)]
 
 
 # -- queue and bulk selection --------------------------------------------------
