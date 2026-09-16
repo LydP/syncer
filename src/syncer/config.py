@@ -34,6 +34,16 @@ def normalize_replica_path(path: str) -> str:
     return os.path.normcase(os.path.normpath(os.path.abspath(path)))
 
 
+def default_rule_name(master: str, master_type: str) -> str:
+    """The add-rule modal's pre-filled name: the master's basename, extension
+    stripped for a file (a folder's basename has no extension to strip).
+    """
+    basename = os.path.basename(os.path.normpath(master))
+    if master_type == "file":
+        return os.path.splitext(basename)[0]
+    return basename
+
+
 def abs_path(root: str, master_type: str, rel_path: str) -> str:
     """The on-disk path of `rel_path` under a master or replica `root`.
 
@@ -60,6 +70,39 @@ class SyncRule:
 class Config:
     version: int
     rules: list[SyncRule] = field(default_factory=list)
+
+
+def _find_path_conflict(
+    config: Config,
+    path: str,
+    paths_of: Callable[[SyncRule], list[str]],
+    exclude_rule_id: str | None,
+) -> SyncRule | None:
+    target = normalize_replica_path(path)
+    for rule in config.rules:
+        if rule.id != exclude_rule_id and any(
+            normalize_replica_path(p) == target for p in paths_of(rule)
+        ):
+            return rule
+    return None
+
+
+def find_master_conflict(
+    config: Config, master: str, *, exclude_rule_id: str | None = None
+) -> SyncRule | None:
+    """The other rule (if any) already using `master` as its master path.
+
+    Non-raising counterpart to load_config's DuplicateMasterError, for the
+    add/edit-rule modal's inline per-row validation.
+    """
+    return _find_path_conflict(config, master, lambda rule: [rule.master], exclude_rule_id)
+
+
+def find_replica_conflict(
+    config: Config, replica: str, *, exclude_rule_id: str | None = None
+) -> SyncRule | None:
+    """The other rule (if any) already using `replica` as one of its replica paths."""
+    return _find_path_conflict(config, replica, lambda rule: rule.replicas, exclude_rule_id)
 
 
 def _require_str(raw_rule: dict, key: str) -> str:
@@ -190,7 +233,20 @@ class ConfigStore:
             return None
 
     def load(self) -> Config:
-        config = load_config(self._config_path)
+        # No config.toml yet is a first run (spec.md §10), not an error —
+        # mirrors load_state's handling of a missing state.json. But a file
+        # this store already loaded or saved that has since vanished is not a
+        # first run: an empty config would make the reconcile after this load
+        # purge every rule's state.json entries.
+        if not self._config_path.exists():
+            if self._loaded_mtime is not None:
+                raise ConfigError(
+                    f"{self._config_path} is missing; restore it (backups are in "
+                    f"{self._backups_dir}) and reload"
+                )
+            config = Config(version=1)
+        else:
+            config = load_config(self._config_path)
         self._loaded_mtime = self._current_mtime()
         return config
 

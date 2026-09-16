@@ -12,6 +12,9 @@ from syncer.config import (
     DuplicateReplicaError,
     MAX_CONFIG_BACKUPS,
     SyncRule,
+    default_rule_name,
+    find_master_conflict,
+    find_replica_conflict,
     load_config,
     normalize_replica_path,
     save_config,
@@ -35,6 +38,56 @@ def _rule_toml(rule_id, master, replicas):
 
 def _write_config(config_path, *rule_tomls):
     config_path.write_text(CONFIG_HEADER + "\n".join(rule_tomls))
+
+
+def test_default_rule_name_strips_extension_for_a_file_master():
+    assert default_rule_name(r"C:\resumes\resume.docx", "file") == "resume"
+
+
+def test_default_rule_name_keeps_full_basename_for_a_dir_master():
+    assert default_rule_name(r"C:\Projects\my-skills", "dir") == "my-skills"
+
+
+def _rule(id, master, replicas, master_type="dir"):
+    return SyncRule(id=id, name=id, master=master, master_type=master_type, replicas=replicas)
+
+
+def test_find_master_conflict_returns_none_when_no_other_rule_uses_the_path():
+    config = Config(version=1, rules=[_rule("r1", r"C:\a", [])])
+
+    assert find_master_conflict(config, r"C:\b") is None
+
+
+def test_find_master_conflict_returns_the_conflicting_rule():
+    other = _rule("r1", r"C:\shared", [])
+    config = Config(version=1, rules=[other])
+
+    assert find_master_conflict(config, r"C:\SHARED") is other
+
+
+def test_find_master_conflict_excludes_the_given_rule_id():
+    config = Config(version=1, rules=[_rule("r1", r"C:\shared", [])])
+
+    assert find_master_conflict(config, r"C:\shared", exclude_rule_id="r1") is None
+
+
+def test_find_replica_conflict_returns_none_when_no_other_rule_uses_the_path():
+    config = Config(version=1, rules=[_rule("r1", r"C:\a", [r"C:\a-replica"])])
+
+    assert find_replica_conflict(config, r"C:\b-replica") is None
+
+
+def test_find_replica_conflict_returns_the_conflicting_rule():
+    other = _rule("r1", r"C:\a", [r"C:\shared-replica"])
+    config = Config(version=1, rules=[other])
+
+    assert find_replica_conflict(config, r"C:\SHARED-REPLICA") is other
+
+
+def test_find_replica_conflict_excludes_the_given_rule_id():
+    config = Config(version=1, rules=[_rule("r1", r"C:\a", [r"C:\shared-replica"])])
+
+    assert find_replica_conflict(config, r"C:\shared-replica", exclude_rule_id="r1") is None
 
 
 def test_normalize_replica_path_resolves_relative_segments_and_case():
@@ -183,6 +236,24 @@ def test_config_store_save_then_load_round_trips(layout):
     store.save(config)
 
     assert store.load() == config
+
+
+def test_config_store_load_returns_an_empty_config_when_no_file_exists(layout):
+    store = ConfigStore(layout.config_path, layout.backups_dir)
+
+    assert store.load() == Config(version=1, rules=[])
+
+
+def test_config_store_load_raises_when_a_previously_loaded_file_has_disappeared(layout):
+    # Not a first run: treating it as an empty config would purge all of
+    # state.json on the reconcile that follows every load.
+    store = ConfigStore(layout.config_path, layout.backups_dir)
+    store.save(Config(version=1, rules=[]))
+    store.load()
+    layout.config_path.unlink()
+
+    with pytest.raises(ConfigError):
+        store.load()
 
 
 def test_config_store_save_raises_when_file_changed_externally_since_load(layout):

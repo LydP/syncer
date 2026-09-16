@@ -12,6 +12,7 @@ from syncer.state import (
     baseline_for_rule,
     load_state,
     merge_replica_entries,
+    reconcile_and_save,
     reconcile_with_config,
     save_state,
 )
@@ -369,3 +370,22 @@ def test_reconcile_with_config_drops_rules_and_replicas_no_longer_configured():
     assert reconciled == _state(
         {"rule-1": {r"c:\a\replica": ReplicaState(last_sync="x", files={})}}
     )
+
+
+def test_reconcile_and_save_persists_a_purge(tmp_path):
+    state_path = tmp_path / "state.json"
+    state = _state({"rule-gone": {r"c:\a\replica": ReplicaState(last_sync="x", files={})}})
+
+    reconciled = reconcile_and_save(state_path, state, Config(version=1))
+
+    assert reconciled == _state({})
+    assert load_state(state_path).state == reconciled
+
+
+def test_reconcile_and_save_does_not_write_when_nothing_was_purged(tmp_path):
+    state_path = tmp_path / "state.json"
+    state = _state({})
+
+    reconcile_and_save(state_path, state, Config(version=1))
+
+    assert not state_path.exists()

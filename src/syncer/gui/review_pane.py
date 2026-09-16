@@ -8,7 +8,9 @@ and is verified by running the app rather than by pytest.
 Conflict resolution (issue #7) is wired in via `syncer.gui.conflict_dialog`:
 the "Resolve conflicts" button and each conflict leaf's "Resolve" cell open
 `ConflictDialog`; the replica branch's context menu offers the per-category
-bulk actions. Rule add/edit/delete (issue #8) stays out of scope.
+bulk actions. Rule add/edit/delete itself lives in `syncer.gui.main_window`
+(issue #8); `apply_config`/`check_rule` below are this pane's side of that
+wiring — the rule list and its check state, not the add/edit/delete UI.
 """
 
 from __future__ import annotations
@@ -94,7 +96,7 @@ class CheckWorker(QThread):
 
     def __init__(self, rule: SyncRule, baseline: dict, parent=None):
         super().__init__(parent)
-        self._rule = rule
+        self.rule = rule
         self._baseline = baseline
         self._cancelled = False
         self._last_emit = 0.0
@@ -110,7 +112,7 @@ class CheckWorker(QThread):
 
     def run(self) -> None:
         result = check(
-            self._rule,
+            self.rule,
             baseline=self._baseline,
             progress=self._report,
             cancel=lambda: self._cancelled,
@@ -227,6 +229,56 @@ class ReviewPane(QWidget):
         self._pending_check_ids = list(self._rules_by_id)
         self._run_next_check()
 
+    def check_rule(self, rule_id: str) -> None:
+        """Public entry point for main_window's toolbar/context-menu "Check"
+        action (spec.md §10), which targets one rule rather than every rule."""
+        self._queue_check(rule_id)
+
+    @property
+    def state(self) -> State:
+        """The one in-memory `State`: every sync/keep/resolve replaces it here,
+        so main_window reads it back rather than keeping its own copy."""
+        return self._state
+
+    @property
+    def current_rule_id(self) -> str | None:
+        return self._current_rule_id
+
+    def apply_config(self, rules: list[SyncRule], state: State) -> None:
+        """The rule set and/or state changed outside the normal check/sync
+        flow — an add/edit/delete-rule action, or a config-reload's
+        reconciliation purge (spec.md §10). Per-rule session state (review,
+        selection, unlock) survives only for a rule whose definition is
+        unchanged — an edited rule's old review would show stale replicas.
+        Rebuilds the left pane's rows, keeping the current selection when the
+        selected rule survives.
+        """
+        old_rules_by_id = self._rules_by_id
+        self._rules_by_id = {rule.id: rule for rule in rules}
+        self._state = state
+        unchanged = {k for k, rule in self._rules_by_id.items() if old_rules_by_id.get(k) == rule}
+        self._review = {k: v for k, v in self._review.items() if k in unchanged}
+        self._selected = defaultdict(
+            frozenset, {k: v for k, v in self._selected.items() if k in unchanged}
+        )
+        self._unlocked &= unchanged
+        self._pending_check_ids = [k for k in self._pending_check_ids if k in self._rules_by_id]
+
+        previous_rule_id = self._current_rule_id
+        with QSignalBlocker(self.rule_list):
+            self.rule_list.clear()  # empties the list, so the refresh recreates rows
+            self._refresh_rule_list()
+        ids = list(self._rules_by_id)  # also the row order
+        if not ids:
+            self._on_rule_row_changed(-1)
+            return
+        rule_id = previous_rule_id if previous_rule_id in self._rules_by_id else ids[0]
+        if rule_id == previous_rule_id and rule_id in unchanged:
+            with QSignalBlocker(self.rule_list):
+                self.rule_list.setCurrentRow(ids.index(rule_id))  # tree is still accurate
+        else:
+            self.rule_list.setCurrentRow(ids.index(rule_id))  # fires _on_rule_row_changed -> _show_rule
+
     def _queue_check(self, rule_id: str) -> None:
         """Adds one rule to the check queue without dropping rules already
         queued (e.g. by an in-progress "Check")."""
@@ -279,6 +331,16 @@ class ReviewPane(QWidget):
     def _on_check_finished(self, result: CheckResult, cancelled: bool) -> None:
         if cancelled:
             # Truncated: rendering it would under-report drift (even "in sync").
+            return
+        current_rule = self._rules_by_id.get(result.rule_id)
+        # Still set here: _worker is cleared on QThread.finished, queued after this.
+        checked_rule = self._worker.rule if self._worker is not None else current_rule
+        if current_rule is None or checked_rule != current_rule:
+            # The rule was deleted or edited (apply_config) mid-check: this
+            # result describes the old definition, so syncing it could write
+            # to a replica no longer configured. Re-check the edited rule.
+            if current_rule is not None and result.rule_id not in self._pending_check_ids:
+                self._pending_check_ids.append(result.rule_id)
             return
         self._unlocked.discard(result.rule_id)  # a re-check re-blocks (spec.md §8)
         self._review[result.rule_id] = build_review_rule(result)

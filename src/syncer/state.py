@@ -189,6 +189,17 @@ def reconcile_with_config(state: State, config: Config) -> State:
     )
 
 
+def reconcile_and_save(state_path: Path, state: State, config: Config) -> State:
+    """`reconcile_with_config`, persisted right away when it purged anything
+    (spec.md §10 — purges apply immediately, not at the next sync). The one
+    path for startup, reload and every GUI rule change alike.
+    """
+    reconciled = reconcile_with_config(state, config)
+    if reconciled != state:
+        save_state(state_path, reconciled)
+    return reconciled
+
+
 def baseline_for_rule(state: State, rule_id: str) -> dict[str, dict[str, BaselineEntry]]:
     return {
         replica_path: replica.files
