@@ -5,7 +5,7 @@ A general-purpose, offline, Windows-only tool that keeps copies of files and fol
 ## Language
 
 **Master**:
-The canonical copy of a file or folder — the one source of truth that all other copies are made to match.
+The canonical copy of a file or folder — the one source of truth that all other copies are made to match. A master path may be listed by more than one sync rule.
 _Avoid_: source, original, home copy
 
 **Replica**:
@@ -13,7 +13,7 @@ A destination path that receives one or more masters' content, kept in sync one-
 _Avoid_: destination, mirror, target, copy
 
 **Sync rule**:
-A set of masters paired with a set of replicas: every master in the rule is kept in sync to every replica in the rule. The unit of configuration. Rules are independent of each other and a replica may belong to more than one rule (e.g. a shared "baseline skills" rule and a separate per-language rule can both target the same project folder). "One rule per project" is just what a rule looks like when its owner chooses not to split its masters across rules — not a distinct mechanic.
+A set of masters paired with a set of replicas: every master in the rule is kept in sync to every replica in the rule. The unit of configuration. Rules are independent of each other, and both a master and a replica may belong to more than one rule (e.g. a shared "baseline skills" master, or a shared project folder as replica, can each be reused by more than one rule). "One rule per project" is just what a rule looks like when its owner chooses not to split its masters across rules — not a distinct mechanic. A rule must have at least one master to exist, but may be saved with no replicas yet, so it can be built out before it has anywhere to sync to.
 _Avoid_: mapping, pair, job
 
 **Check**:
