@@ -9,11 +9,11 @@ The canonical copy of a file or folder — the one source of truth that all othe
 _Avoid_: source, original, home copy
 
 **Replica**:
-A copy of a master living at a specific absolute destination path, kept in sync one-way from the master.
+A destination path that receives one or more masters' content, kept in sync one-way from those masters. A folder-type master lands under a subfolder of the replica named for the master's own basename (so a rule's several masters don't collide); a file-type master lands directly at the replica path plus its filename. A replica path may be listed by more than one sync rule.
 _Avoid_: destination, mirror, target, copy
 
 **Sync rule**:
-One master paired with the list of replicas that should match it. The unit of configuration; one rule per syncable unit (e.g. one skill folder).
+A set of masters paired with a set of replicas: every master in the rule is kept in sync to every replica in the rule. The unit of configuration. Rules are independent of each other and a replica may belong to more than one rule (e.g. a shared "baseline skills" rule and a separate per-language rule can both target the same project folder). "One rule per project" is just what a rule looks like when its owner chooses not to split its masters across rules — not a distinct mechanic.
 _Avoid_: mapping, pair, job
 
 **Check**:
