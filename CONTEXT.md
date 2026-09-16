@@ -62,5 +62,5 @@ A file where the user resolved a conflict by choosing to keep the replica's vers
 _Avoid_: resolved (covers all three resolution outcomes, not just this one), ignored (skip is the no-op that leaves no record; kept leaves one)
 
 **Master missing**:
-The state where a sync rule's entire master — the whole directory, or the one file for a file-type rule — doesn't exist or can't be read at check time, as distinct from individual files having been deleted from a master that's still there. Blocks ordinary sync for that rule until the user explicitly unlocks it, so a bad path or an unmounted drive can't masquerade as "the master deleted everything."
+The state where one of a rule's masters — the whole directory, or the one file for a file-type master — doesn't exist or can't be read at check time, as distinct from individual files having been deleted from a master that's still there. Evaluated per master: blocks ordinary sync for that master's namespace only, across every replica in the rule, until the user explicitly unlocks it, so a bad path or an unmounted drive can't masquerade as "this master deleted everything" — while the rule's other masters keep syncing normally.
 _Avoid_: master_deleted (the per-file category for content removed while the rule's master root is still present)
