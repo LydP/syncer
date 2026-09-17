@@ -3,8 +3,8 @@ import os
 import pytest
 
 import syncer.check as check_module
-from syncer.check import BaselineEntry, baseline_from_disk, check, hash_file
-from syncer.config import SyncRule, normalize_replica_path
+from syncer.check import BaselineEntry, baseline_from_disk, check, find_namespace_collisions, hash_file
+from syncer.config import Master, SyncRule, normalize_replica_path
 
 # Any digest that can't match real content, for exercising a stale baseline.
 _STALE_HASH = "0" * 64
@@ -36,12 +36,15 @@ def _baseline(replica, entries):
     return {normalize_replica_path(str(replica)): entries}
 
 
-def _rule(master, replicas, master_type="dir"):
+def _rule(master, replicas, master_type="dir", rule_id="r1"):
+    return _multi_rule([Master(path=str(master), type=master_type)], replicas, rule_id)
+
+
+def _multi_rule(masters, replicas, rule_id="r1"):
     return SyncRule(
-        id="r1",
-        name="Rule 1",
-        master=str(master),
-        master_type=master_type,
+        id=rule_id,
+        name=f"Rule {rule_id}",
+        masters=masters,
         replicas=[str(r) for r in replicas],
     )
 
@@ -55,11 +58,11 @@ def _only_change(result):
 def test_identical_file_in_master_and_replica_is_in_sync(master_and_replica):
     master, replica = master_and_replica
     (master / "a.txt").write_text("hello")
-    (replica / "a.txt").write_text("hello")
+    (replica / "master" / "a.txt").write_text("hello")
 
     change = _only_change(check(_rule(master, [replica])))
 
-    assert change.rel_path == "a.txt"
+    assert change.rel_path == "master/a.txt"
     assert change.category == "in_sync"
 
 
@@ -69,7 +72,7 @@ def test_file_only_in_master_is_new(master_and_replica):
 
     change = _only_change(check(_rule(master, [replica])))
 
-    assert change.rel_path == "a.txt"
+    assert change.rel_path == "master/a.txt"
     assert change.category == "new"
     assert change.master_present is True
     assert change.replica_present is False
@@ -77,11 +80,11 @@ def test_file_only_in_master_is_new(master_and_replica):
 
 def test_file_only_in_replica_is_replica_only(master_and_replica):
     master, replica = master_and_replica
-    (replica / "extra.txt").write_text("hello")
+    (replica / "master" / "extra.txt").write_text("hello")
 
     change = _only_change(check(_rule(master, [replica])))
 
-    assert change.rel_path == "extra.txt"
+    assert change.rel_path == "master/extra.txt"
     assert change.category == "replica_only"
     assert change.master_present is False
     assert change.replica_present is True
@@ -90,8 +93,8 @@ def test_file_only_in_replica_is_replica_only(master_and_replica):
 def test_master_edited_since_last_sync_is_changed(master_and_replica):
     master, replica = master_and_replica
     (master / "a.txt").write_text("hello")
-    (replica / "a.txt").write_text("hello")
-    baseline = _baseline(replica, {"a.txt": _baseline_entry_for(replica / "a.txt")})
+    (replica / "master" / "a.txt").write_text("hello")
+    baseline = _baseline(replica, {"master/a.txt": _baseline_entry_for(replica / "master" / "a.txt")})
     (master / "a.txt").write_text("hello world")
 
     change = _only_change(check(_rule(master, [replica]), baseline=baseline))
@@ -102,9 +105,9 @@ def test_master_edited_since_last_sync_is_changed(master_and_replica):
 def test_replica_edited_since_last_sync_is_diverged(master_and_replica):
     master, replica = master_and_replica
     (master / "a.txt").write_text("hello")
-    (replica / "a.txt").write_text("hello")
-    baseline = _baseline(replica, {"a.txt": _baseline_entry_for(master / "a.txt")})
-    (replica / "a.txt").write_text("edited locally")
+    (replica / "master" / "a.txt").write_text("hello")
+    baseline = _baseline(replica, {"master/a.txt": _baseline_entry_for(master / "a.txt")})
+    (replica / "master" / "a.txt").write_text("edited locally")
 
     change = _only_change(check(_rule(master, [replica]), baseline=baseline))
 
@@ -114,10 +117,10 @@ def test_replica_edited_since_last_sync_is_diverged(master_and_replica):
 def test_both_master_and_replica_edited_since_last_sync_is_both_changed(master_and_replica):
     master, replica = master_and_replica
     (master / "a.txt").write_text("hello")
-    (replica / "a.txt").write_text("hello")
-    baseline = _baseline(replica, {"a.txt": _baseline_entry_for(master / "a.txt")})
+    (replica / "master" / "a.txt").write_text("hello")
+    baseline = _baseline(replica, {"master/a.txt": _baseline_entry_for(master / "a.txt")})
     (master / "a.txt").write_text("edited in master")
-    (replica / "a.txt").write_text("edited in replica")
+    (replica / "master" / "a.txt").write_text("edited in replica")
 
     change = _only_change(check(_rule(master, [replica]), baseline=baseline))
 
@@ -127,7 +130,7 @@ def test_both_master_and_replica_edited_since_last_sync_is_both_changed(master_a
 def test_no_baseline_entry_but_content_differs_is_no_baseline(master_and_replica):
     master, replica = master_and_replica
     (master / "a.txt").write_text("hello")
-    (replica / "a.txt").write_text("different")
+    (replica / "master" / "a.txt").write_text("different")
 
     change = _only_change(check(_rule(master, [replica])))
 
@@ -137,8 +140,8 @@ def test_no_baseline_entry_but_content_differs_is_no_baseline(master_and_replica
 def test_master_and_replica_converge_on_same_content_refreshes_stale_baseline(master_and_replica):
     master, replica = master_and_replica
     (master / "a.txt").write_text("hello")
-    (replica / "a.txt").write_text("hello")
-    baseline = _baseline(replica, {"a.txt": BaselineEntry(hash=_STALE_HASH, size=11, mtime=1.0)})
+    (replica / "master" / "a.txt").write_text("hello")
+    baseline = _baseline(replica, {"master/a.txt": BaselineEntry(hash=_STALE_HASH, size=11, mtime=1.0)})
 
     change = _only_change(check(_rule(master, [replica]), baseline=baseline))
 
@@ -149,8 +152,8 @@ def test_master_and_replica_converge_on_same_content_refreshes_stale_baseline(ma
 def test_file_deleted_from_master_with_untouched_replica_is_master_deleted(master_and_replica):
     master, replica = master_and_replica
     (master / "a.txt").write_text("hello")
-    (replica / "a.txt").write_text("hello")
-    baseline = _baseline(replica, {"a.txt": _baseline_entry_for(replica / "a.txt")})
+    (replica / "master" / "a.txt").write_text("hello")
+    baseline = _baseline(replica, {"master/a.txt": _baseline_entry_for(replica / "master" / "a.txt")})
     (master / "a.txt").unlink()
 
     change = _only_change(check(_rule(master, [replica]), baseline=baseline))
@@ -161,10 +164,10 @@ def test_file_deleted_from_master_with_untouched_replica_is_master_deleted(maste
 def test_file_deleted_from_master_but_also_edited_in_replica_is_both_changed(master_and_replica):
     master, replica = master_and_replica
     (master / "a.txt").write_text("hello")
-    (replica / "a.txt").write_text("hello")
-    baseline = _baseline(replica, {"a.txt": _baseline_entry_for(replica / "a.txt")})
+    (replica / "master" / "a.txt").write_text("hello")
+    baseline = _baseline(replica, {"master/a.txt": _baseline_entry_for(replica / "master" / "a.txt")})
     (master / "a.txt").unlink()
-    (replica / "a.txt").write_text("edited locally")
+    (replica / "master" / "a.txt").write_text("edited locally")
 
     change = _only_change(check(_rule(master, [replica]), baseline=baseline))
 
@@ -174,9 +177,9 @@ def test_file_deleted_from_master_but_also_edited_in_replica_is_both_changed(mas
 def test_replica_file_locally_deleted_but_master_and_baseline_agree_is_new(master_and_replica):
     master, replica = master_and_replica
     (master / "a.txt").write_text("hello")
-    (replica / "a.txt").write_text("hello")
-    baseline = _baseline(replica, {"a.txt": _baseline_entry_for(replica / "a.txt")})
-    (replica / "a.txt").unlink()
+    (replica / "master" / "a.txt").write_text("hello")
+    baseline = _baseline(replica, {"master/a.txt": _baseline_entry_for(replica / "master" / "a.txt")})
+    (replica / "master" / "a.txt").unlink()
 
     change = _only_change(check(_rule(master, [replica]), baseline=baseline))
 
@@ -186,8 +189,8 @@ def test_replica_file_locally_deleted_but_master_and_baseline_agree_is_new(maste
 def test_kept_entry_unchanged_on_both_sides_is_kept(master_and_replica):
     master, replica = master_and_replica
     (master / "a.txt").write_text("master content")
-    (replica / "a.txt").write_text("kept replica content")
-    baseline = _baseline(replica, {"a.txt": _kept_entry_for(replica / "a.txt", master / "a.txt")})
+    (replica / "master" / "a.txt").write_text("kept replica content")
+    baseline = _baseline(replica, {"master/a.txt": _kept_entry_for(replica / "master" / "a.txt", master / "a.txt")})
 
     change = _only_change(check(_rule(master, [replica]), baseline=baseline))
 
@@ -197,8 +200,8 @@ def test_kept_entry_unchanged_on_both_sides_is_kept(master_and_replica):
 def test_kept_entry_with_master_changed_since_keep_is_changed(master_and_replica):
     master, replica = master_and_replica
     (master / "a.txt").write_text("master content")
-    (replica / "a.txt").write_text("kept replica content")
-    baseline = _baseline(replica, {"a.txt": _kept_entry_for(replica / "a.txt", master / "a.txt")})
+    (replica / "master" / "a.txt").write_text("kept replica content")
+    baseline = _baseline(replica, {"master/a.txt": _kept_entry_for(replica / "master" / "a.txt", master / "a.txt")})
     (master / "a.txt").write_text("master content, edited after the keep")
 
     change = _only_change(check(_rule(master, [replica]), baseline=baseline))
@@ -209,9 +212,9 @@ def test_kept_entry_with_master_changed_since_keep_is_changed(master_and_replica
 def test_kept_entry_with_replica_changed_since_keep_is_diverged(master_and_replica):
     master, replica = master_and_replica
     (master / "a.txt").write_text("master content")
-    (replica / "a.txt").write_text("kept replica content")
-    baseline = _baseline(replica, {"a.txt": _kept_entry_for(replica / "a.txt", master / "a.txt")})
-    (replica / "a.txt").write_text("kept replica content, edited again")
+    (replica / "master" / "a.txt").write_text("kept replica content")
+    baseline = _baseline(replica, {"master/a.txt": _kept_entry_for(replica / "master" / "a.txt", master / "a.txt")})
+    (replica / "master" / "a.txt").write_text("kept replica content, edited again")
 
     change = _only_change(check(_rule(master, [replica]), baseline=baseline))
 
@@ -221,10 +224,10 @@ def test_kept_entry_with_replica_changed_since_keep_is_diverged(master_and_repli
 def test_kept_entry_with_both_changed_since_keep_is_both_changed(master_and_replica):
     master, replica = master_and_replica
     (master / "a.txt").write_text("master content")
-    (replica / "a.txt").write_text("kept replica content")
-    baseline = _baseline(replica, {"a.txt": _kept_entry_for(replica / "a.txt", master / "a.txt")})
+    (replica / "master" / "a.txt").write_text("kept replica content")
+    baseline = _baseline(replica, {"master/a.txt": _kept_entry_for(replica / "master" / "a.txt", master / "a.txt")})
     (master / "a.txt").write_text("master content, edited after the keep")
-    (replica / "a.txt").write_text("kept replica content, edited again")
+    (replica / "master" / "a.txt").write_text("kept replica content, edited again")
 
     change = _only_change(check(_rule(master, [replica]), baseline=baseline))
 
@@ -233,8 +236,8 @@ def test_kept_entry_with_both_changed_since_keep_is_both_changed(master_and_repl
 
 def test_kept_entry_whose_master_was_absent_and_stays_absent_is_kept(master_and_replica):
     master, replica = master_and_replica
-    (replica / "a.txt").write_text("kept replica content")
-    baseline = _baseline(replica, {"a.txt": _kept_entry_for(replica / "a.txt")})
+    (replica / "master" / "a.txt").write_text("kept replica content")
+    baseline = _baseline(replica, {"master/a.txt": _kept_entry_for(replica / "master" / "a.txt")})
 
     change = _only_change(check(_rule(master, [replica]), baseline=baseline))
 
@@ -245,9 +248,9 @@ def test_kept_entry_whose_master_stays_absent_and_replica_edited_again_is_diverg
     master_and_replica,
 ):
     master, replica = master_and_replica
-    (replica / "a.txt").write_text("kept replica content")
-    baseline = _baseline(replica, {"a.txt": _kept_entry_for(replica / "a.txt")})
-    (replica / "a.txt").write_text("kept replica content, edited again")
+    (replica / "master" / "a.txt").write_text("kept replica content")
+    baseline = _baseline(replica, {"master/a.txt": _kept_entry_for(replica / "master" / "a.txt")})
+    (replica / "master" / "a.txt").write_text("kept replica content, edited again")
 
     change = _only_change(check(_rule(master, [replica]), baseline=baseline))
 
@@ -260,8 +263,8 @@ def test_kept_entry_whose_absent_master_reappears_unchanged_replica_is_changed(
     master_and_replica,
 ):
     master, replica = master_and_replica
-    (replica / "a.txt").write_text("kept replica content")
-    baseline = _baseline(replica, {"a.txt": _kept_entry_for(replica / "a.txt")})
+    (replica / "master" / "a.txt").write_text("kept replica content")
+    baseline = _baseline(replica, {"master/a.txt": _kept_entry_for(replica / "master" / "a.txt")})
     (master / "a.txt").write_text("master reappeared")
 
     change = _only_change(check(_rule(master, [replica]), baseline=baseline))
@@ -274,8 +277,8 @@ def test_kept_entry_whose_present_master_is_later_deleted_with_replica_unchanged
 ):
     master, replica = master_and_replica
     (master / "a.txt").write_text("master content")
-    (replica / "a.txt").write_text("kept replica content")
-    baseline = _baseline(replica, {"a.txt": _kept_entry_for(replica / "a.txt", master / "a.txt")})
+    (replica / "master" / "a.txt").write_text("kept replica content")
+    baseline = _baseline(replica, {"master/a.txt": _kept_entry_for(replica / "master" / "a.txt", master / "a.txt")})
     (master / "a.txt").unlink()
 
     change = _only_change(check(_rule(master, [replica]), baseline=baseline))
@@ -288,10 +291,10 @@ def test_kept_entry_whose_present_master_is_later_deleted_with_replica_edited_is
 ):
     master, replica = master_and_replica
     (master / "a.txt").write_text("master content")
-    (replica / "a.txt").write_text("kept replica content")
-    baseline = _baseline(replica, {"a.txt": _kept_entry_for(replica / "a.txt", master / "a.txt")})
+    (replica / "master" / "a.txt").write_text("kept replica content")
+    baseline = _baseline(replica, {"master/a.txt": _kept_entry_for(replica / "master" / "a.txt", master / "a.txt")})
     (master / "a.txt").unlink()
-    (replica / "a.txt").write_text("kept replica content, edited again")
+    (replica / "master" / "a.txt").write_text("kept replica content, edited again")
 
     change = _only_change(check(_rule(master, [replica]), baseline=baseline))
 
@@ -303,8 +306,8 @@ def test_kept_entry_masters_stat_coincidentally_matching_baseline_still_detects_
 ):
     master, replica = master_and_replica
     (master / "a.txt").write_text("master content")
-    (replica / "a.txt").write_text("kept replica content")
-    kept_entry = _kept_entry_for(replica / "a.txt", master / "a.txt")
+    (replica / "master" / "a.txt").write_text("kept replica content")
+    kept_entry = _kept_entry_for(replica / "master" / "a.txt", master / "a.txt")
     # Same byte size as the replica's kept content but different bytes, so a
     # stat-only shortcut (reusing the kept entry's replica-derived size for
     # the master) would wrongly call this unchanged.
@@ -313,7 +316,7 @@ def test_kept_entry_masters_stat_coincidentally_matching_baseline_still_detects_
     # entry's stored mtime too, which belongs to the *replica's* file.
     os.utime(master / "a.txt", (kept_entry.mtime, kept_entry.mtime))
     assert (master / "a.txt").stat().st_size == kept_entry.size
-    baseline = _baseline(replica, {"a.txt": kept_entry})
+    baseline = _baseline(replica, {"master/a.txt": kept_entry})
 
     change = _only_change(check(_rule(master, [replica]), baseline=baseline))
 
@@ -331,15 +334,16 @@ def test_missing_replica_reports_every_master_file_as_new(tmp_path):
     [replica_result] = result.replicas
     assert replica_result.replica_exists is False
     change = _only_change(result)
-    assert change.rel_path == "a.txt"
+    assert change.rel_path == "master/a.txt"
     assert change.category == "new"
 
 
 def test_single_file_master_compares_the_one_file(tmp_path):
     master = tmp_path / "resume.docx"
-    replica = tmp_path / "resume_copy.docx"
+    replica = tmp_path / "replica"
     master.write_text("v1")
-    replica.write_text("v2")
+    replica.mkdir()
+    (replica / "resume.docx").write_text("v2")
 
     change = _only_change(check(_rule(master, [replica], master_type="file")))
 
@@ -365,28 +369,28 @@ def test_nested_file_rel_path_uses_posix_separators(master_and_replica):
 
     change = _only_change(check(_rule(master, [replica])))
 
-    assert change.rel_path == "sub/nested.txt"
+    assert change.rel_path == "master/sub/nested.txt"
 
 
 def test_matches_by_rel_path_case_insensitively_preserving_master_casing(master_and_replica):
     master, replica = master_and_replica
     (master / "README.txt").write_text("hello")
-    (replica / "readme.txt").write_text("hello")
+    (replica / "master" / "readme.txt").write_text("hello")
 
     change = _only_change(check(_rule(master, [replica])))
 
-    assert change.rel_path == "README.txt"
+    assert change.rel_path == "master/README.txt"
     assert change.category == "in_sync"
 
 
 def test_file_vs_directory_type_mismatch_is_unreadable(master_and_replica):
     master, replica = master_and_replica
     (master / "thing").write_text("a file")
-    (replica / "thing").mkdir()
+    (replica / "master" / "thing").mkdir()
 
     change = _only_change(check(_rule(master, [replica])))
 
-    assert change.rel_path == "thing"
+    assert change.rel_path == "master/thing"
     assert change.category == "unreadable"
 
 
@@ -395,11 +399,11 @@ def test_file_symlink_in_master_is_followed_and_compared_by_content(master_and_r
     real_target = tmp_path / "real.txt"
     real_target.write_text("hello")
     _symlink(str(real_target), str(master / "link.txt"))
-    (replica / "link.txt").write_text("hello")
+    (replica / "master" / "link.txt").write_text("hello")
 
     change = _only_change(check(_rule(master, [replica])))
 
-    assert change.rel_path == "link.txt"
+    assert change.rel_path == "master/link.txt"
     assert change.category == "in_sync"
 
 
@@ -412,21 +416,21 @@ def test_directory_symlink_in_master_is_unreadable(master_and_replica, tmp_path)
 
     change = _only_change(check(_rule(master, [replica])))
 
-    assert change.rel_path == "linked_dir"
+    assert change.rel_path == "master/linked_dir"
     assert change.category == "unreadable"
 
 
 def test_unreadable_file_is_reported_without_aborting_the_check(master_and_replica, monkeypatch):
     master, replica = master_and_replica
     (master / "broken.txt").write_text("hello")
-    (replica / "broken.txt").write_text("hello")
+    (replica / "master" / "broken.txt").write_text("hello")
     (master / "fine.txt").write_text("world")
-    (replica / "fine.txt").write_text("world")
+    (replica / "master" / "fine.txt").write_text("world")
 
     real_open = open
 
     def flaky_open(path, *args, **kwargs):
-        if os.path.basename(path) == "broken.txt" and "master" in str(path):
+        if os.path.basename(path) == "broken.txt" and str(path).startswith(str(master)):
             raise PermissionError(13, "Permission denied")
         return real_open(path, *args, **kwargs)
 
@@ -436,9 +440,9 @@ def test_unreadable_file_is_reported_without_aborting_the_check(master_and_repli
 
     [replica_result] = result.replicas
     changes_by_path = {c.rel_path: c for c in replica_result.files}
-    assert changes_by_path["broken.txt"].category == "unreadable"
-    assert "Permission denied" in changes_by_path["broken.txt"].detail
-    assert changes_by_path["fine.txt"].category == "in_sync"
+    assert changes_by_path["master/broken.txt"].category == "unreadable"
+    assert "Permission denied" in changes_by_path["master/broken.txt"].detail
+    assert changes_by_path["master/fine.txt"].category == "in_sync"
 
 
 def test_directory_listing_error_is_collected_as_walk_error(master_and_replica, monkeypatch):
@@ -446,8 +450,8 @@ def test_directory_listing_error_is_collected_as_walk_error(master_and_replica, 
     (master / "locked").mkdir()
     (master / "ok").mkdir()
     (master / "ok" / "a.txt").write_text("hello")
-    (replica / "ok").mkdir()
-    (replica / "ok" / "a.txt").write_text("hello")
+    (replica / "master" / "ok").mkdir()
+    (replica / "master" / "ok" / "a.txt").write_text("hello")
 
     real_scandir = os.scandir
 
@@ -465,8 +469,45 @@ def test_directory_listing_error_is_collected_as_walk_error(master_and_replica, 
     assert "locked" in replica_result.walk_errors[0]["path"]
     assert "Permission denied" in replica_result.walk_errors[0]["message"]
     change = _only_change(result)
-    assert change.rel_path == "ok/a.txt"
+    assert change.rel_path == "master/ok/a.txt"
     assert change.category == "in_sync"
+
+
+def test_replica_listing_error_outside_the_rules_landing_paths_is_not_reported(
+    master_and_replica, monkeypatch
+):
+    master, replica = master_and_replica
+    (master / "a.txt").write_text("hello")
+    (replica / "master" / "a.txt").write_text("hello")
+    (replica / "unrelated").mkdir()
+
+    real_scandir = os.scandir
+
+    def flaky_scandir(path="."):
+        if os.path.basename(str(path)) == "unrelated":
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", flaky_scandir)
+
+    [replica_result] = check(_rule(master, [replica])).replicas
+
+    assert replica_result.walk_errors == []
+
+
+def test_file_where_a_dir_masters_landing_folder_belongs_is_a_type_mismatch(tmp_path):
+    master = tmp_path / "notes"
+    master.mkdir()
+    (master / "a.txt").write_text("hello")
+    replica = tmp_path / "replica"
+    replica.mkdir()
+    (replica / "notes").write_text("a file, not a folder")
+
+    [replica_result] = check(_rule(master, [replica])).replicas
+
+    changes_by_path = {c.rel_path: c for c in replica_result.files}
+    assert changes_by_path["notes"].category == "unreadable"
+    assert "type mismatch" in changes_by_path["notes"].detail
 
 
 def _fail_listing_of(monkeypatch, dir_name):
@@ -482,13 +523,13 @@ def _fail_listing_of(monkeypatch, dir_name):
 
 def test_unlistable_master_root_sets_master_missing_flag(master_and_replica, monkeypatch):
     master, replica = master_and_replica
-    (replica / "a.txt").write_text("hello")
-    baseline = _baseline(replica, {"a.txt": _baseline_entry_for(replica / "a.txt")})
+    (replica / "master" / "a.txt").write_text("hello")
+    baseline = _baseline(replica, {"master/a.txt": _baseline_entry_for(replica / "master" / "a.txt")})
     _fail_listing_of(monkeypatch, "master")
 
     result = check(_rule(master, [replica]), baseline=baseline)
 
-    assert result.master_missing is True
+    assert result.masters[0].missing is True
 
 
 def test_file_under_unlistable_master_folder_is_unreadable_not_master_deleted(
@@ -497,25 +538,26 @@ def test_file_under_unlistable_master_folder_is_unreadable_not_master_deleted(
     master, replica = master_and_replica
     (master / "locked").mkdir()
     (master / "locked" / "a.txt").write_text("hello")
-    (replica / "locked").mkdir()
-    (replica / "locked" / "a.txt").write_text("hello")
+    (replica / "master" / "locked").mkdir()
+    (replica / "master" / "locked" / "a.txt").write_text("hello")
     baseline = _baseline(
-        replica, {"locked/a.txt": _baseline_entry_for(replica / "locked" / "a.txt")}
+        replica, {"master/locked/a.txt": _baseline_entry_for(replica / "master" / "locked" / "a.txt")}
     )
     _fail_listing_of(monkeypatch, "locked")
 
     result = check(_rule(master, [replica]), baseline=baseline)
 
     [replica_result] = result.replicas
-    [change] = [c for c in replica_result.files if c.rel_path == "locked/a.txt"]
+    [change] = [c for c in replica_result.files if c.rel_path == "master/locked/a.txt"]
     assert change.category == "unreadable"
 
 
-def test_single_file_rule_with_folder_at_replica_path_is_unreadable(tmp_path):
+def test_single_file_masters_landing_spot_being_a_folder_in_replica_is_unreadable(tmp_path):
     master = tmp_path / "resume.docx"
-    replica = tmp_path / "replica_dir"
+    replica = tmp_path / "replica"
     master.write_text("v1")
     replica.mkdir()
+    (replica / "resume.docx").mkdir()  # a folder sits where the master's file should land
 
     change = _only_change(check(_rule(master, [replica], master_type="file")))
 
@@ -524,10 +566,11 @@ def test_single_file_rule_with_folder_at_replica_path_is_unreadable(tmp_path):
 
 def test_single_file_rule_with_folder_at_master_path_is_not_master_deleted(tmp_path):
     master = tmp_path / "resume.docx"
-    replica = tmp_path / "resume_copy.docx"
+    replica = tmp_path / "replica"
     master.mkdir()
-    replica.write_text("v1")
-    baseline = _baseline(replica, {"resume.docx": _baseline_entry_for(replica)})
+    replica.mkdir()
+    (replica / "resume.docx").write_text("v1")
+    baseline = _baseline(replica, {"resume.docx": _baseline_entry_for(replica / "resume.docx")})
 
     change = _only_change(check(_rule(master, [replica], master_type="file"), baseline=baseline))
 
@@ -544,7 +587,7 @@ def test_directory_junction_in_master_is_unreadable_and_not_recursed(master_and_
 
     change = _only_change(check(_rule(master, [replica])))
 
-    assert change.rel_path == "junction"
+    assert change.rel_path == "master/junction"
     assert change.category == "unreadable"
 
 
@@ -552,14 +595,14 @@ def test_progress_callback_is_invoked_between_files(master_and_replica):
     master, replica = master_and_replica
     (master / "a.txt").write_text("hello")
     (master / "b.txt").write_text("world")
-    (replica / "a.txt").write_text("hello")
-    (replica / "b.txt").write_text("world")
+    (replica / "master" / "a.txt").write_text("hello")
+    (replica / "master" / "b.txt").write_text("world")
 
     calls = []
     check(_rule(master, [replica]), progress=lambda done, total, path: calls.append((done, total, path)))
 
     assert len(calls) == 2
-    assert {c[2] for c in calls} == {"a.txt", "b.txt"}
+    assert {c[2] for c in calls} == {"master/a.txt", "master/b.txt"}
     assert all(total == 2 for _, total, _ in calls)
     assert sorted(c[0] for c in calls) == [1, 2]
 
@@ -568,9 +611,10 @@ def test_progress_total_spans_every_replica(master_and_replica, tmp_path):
     master, replica = master_and_replica
     second_replica = tmp_path / "replica2"
     second_replica.mkdir()
+    (second_replica / "master").mkdir()
     (master / "a.txt").write_text("hello")
-    (replica / "a.txt").write_text("hello")
-    (second_replica / "a.txt").write_text("hello")
+    (replica / "master" / "a.txt").write_text("hello")
+    (second_replica / "master" / "a.txt").write_text("hello")
 
     calls = []
     check(
@@ -587,9 +631,9 @@ def test_cancel_callback_stops_check_early_with_partial_result(master_and_replic
     (master / "a.txt").write_text("hello")
     (master / "b.txt").write_text("world")
     (master / "c.txt").write_text("!!!")
-    (replica / "a.txt").write_text("hello")
-    (replica / "b.txt").write_text("world")
-    (replica / "c.txt").write_text("!!!")
+    (replica / "master" / "a.txt").write_text("hello")
+    (replica / "master" / "b.txt").write_text("world")
+    (replica / "master" / "c.txt").write_text("!!!")
 
     seen = []
 
@@ -609,34 +653,36 @@ def test_cancel_callback_stops_check_early_with_partial_result(master_and_replic
 def test_file_change_reports_master_and_replica_sizes(master_and_replica):
     master, replica = master_and_replica
     (master / "both.txt").write_text("hello world")  # 11 bytes
-    (replica / "both.txt").write_text("hi")  # 2 bytes
+    (replica / "master" / "both.txt").write_text("hi")  # 2 bytes
     (master / "only_master.txt").write_text("xy")  # 2 bytes
 
     result = check(_rule(master, [replica]))
 
     [replica_result] = result.replicas
     changes_by_path = {c.rel_path: c for c in replica_result.files}
-    assert changes_by_path["both.txt"].master_size == 11
-    assert changes_by_path["both.txt"].replica_size == 2
-    assert changes_by_path["only_master.txt"].master_size == 2
-    assert changes_by_path["only_master.txt"].replica_size is None
+    assert changes_by_path["master/both.txt"].master_size == 11
+    assert changes_by_path["master/both.txt"].replica_size == 2
+    assert changes_by_path["master/only_master.txt"].master_size == 2
+    assert changes_by_path["master/only_master.txt"].replica_size is None
 
 
 def test_file_change_reports_baseline_size_and_mtime(master_and_replica):
     master, replica = master_and_replica
     (master / "a.txt").write_text("master content")
-    (replica / "a.txt").write_text("replica content")
+    (replica / "master" / "a.txt").write_text("replica content")
     (master / "b.txt").write_text("new")
-    baseline = _baseline(replica, {"A.TXT": BaselineEntry(hash="deadbeef", size=1234, mtime=5678.0)})
+    baseline = _baseline(
+        replica, {"master/A.TXT": BaselineEntry(hash="deadbeef", size=1234, mtime=5678.0)}
+    )
 
     result = check(_rule(master, [replica]), baseline=baseline)
 
     [replica_result] = result.replicas
     changes_by_path = {c.rel_path: c for c in replica_result.files}
-    assert changes_by_path["a.txt"].baseline_size == 1234
-    assert changes_by_path["a.txt"].baseline_mtime == 5678.0
-    assert changes_by_path["b.txt"].baseline_size is None
-    assert changes_by_path["b.txt"].baseline_mtime is None
+    assert changes_by_path["master/a.txt"].baseline_size == 1234
+    assert changes_by_path["master/a.txt"].baseline_mtime == 5678.0
+    assert changes_by_path["master/b.txt"].baseline_size is None
+    assert changes_by_path["master/b.txt"].baseline_mtime is None
 
 
 def test_missing_master_directory_sets_master_missing_flag(tmp_path):
@@ -646,16 +692,17 @@ def test_missing_master_directory_sets_master_missing_flag(tmp_path):
 
     result = check(_rule(master, [replica]))
 
-    assert result.master_missing is True
+    assert result.masters[0].missing is True
 
 
 def test_missing_master_file_sets_master_missing_flag(tmp_path):
     master = tmp_path / "resume.docx"  # never created
-    replica = tmp_path / "resume_copy.docx"
+    replica = tmp_path / "replica"
+    replica.mkdir()
 
     result = check(_rule(master, [replica], master_type="file"))
 
-    assert result.master_missing is True
+    assert result.masters[0].missing is True
 
 
 def test_present_master_does_not_set_master_missing_flag(master_and_replica):
@@ -663,7 +710,7 @@ def test_present_master_does_not_set_master_missing_flag(master_and_replica):
 
     result = check(_rule(master, [replica]))
 
-    assert result.master_missing is False
+    assert result.masters[0].missing is False
 
 
 def test_pyc_files_are_ignored(master_and_replica):
@@ -696,8 +743,9 @@ def test_each_replica_is_categorized_independently(tmp_path):
     empty = tmp_path / "empty"
     for path in (master, matching, empty):
         path.mkdir()
+    (matching / "master").mkdir()
     (master / "a.txt").write_text("hello")
-    (matching / "a.txt").write_text("hello")
+    (matching / "master" / "a.txt").write_text("hello")
 
     result = check(_rule(master, [matching, empty]))
 
@@ -713,7 +761,8 @@ def test_master_file_is_hashed_once_across_replicas(tmp_path, monkeypatch):
     replicas = [tmp_path / "r1", tmp_path / "r2", tmp_path / "r3"]
     for replica in replicas:
         replica.mkdir()
-        (replica / "a.txt").write_text("hello")
+        (replica / "master").mkdir()
+        (replica / "master" / "a.txt").write_text("hello")
 
     hashed = []
     real_hash_file = check_module.hash_file
@@ -729,3 +778,157 @@ def test_master_file_is_hashed_once_across_replicas(tmp_path, monkeypatch):
     assert len(result.replicas) == 3
     assert all(r.files[0].category == "in_sync" for r in result.replicas)
     assert hashed.count(str(master / "a.txt")) == 1
+
+
+def test_two_masters_land_under_separate_namespaces_in_one_replica(tmp_path):
+    dir_master = tmp_path / "skills"
+    file_master = tmp_path / "resume.docx"
+    replica = tmp_path / "replica"
+    dir_master.mkdir()
+    (dir_master / "one.md").write_text("hello")
+    file_master.write_text("v1")
+    replica.mkdir()
+    (replica / "skills").mkdir()
+    (replica / "skills" / "one.md").write_text("hello")
+    (replica / "resume.docx").write_text("v1")
+
+    rule = _multi_rule(
+        [Master(path=str(dir_master), type="dir"), Master(path=str(file_master), type="file")],
+        [replica],
+    )
+
+    result = check(rule)
+
+    [replica_result] = result.replicas
+    changes_by_path = {c.rel_path: c for c in replica_result.files}
+    assert changes_by_path["skills/one.md"].category == "in_sync"
+    assert changes_by_path["resume.docx"].category == "in_sync"
+
+
+def test_master_missing_is_evaluated_independently_per_master(tmp_path):
+    missing_master = tmp_path / "skills"  # never created
+    present_master = tmp_path / "notes"
+    replica = tmp_path / "replica"
+    present_master.mkdir()
+    (present_master / "a.txt").write_text("hello")
+    replica.mkdir()
+
+    rule = _multi_rule(
+        [Master(path=str(missing_master), type="dir"), Master(path=str(present_master), type="dir")],
+        [replica],
+    )
+
+    result = check(rule)
+
+    missing_by_path = {s.master.path: s.missing for s in result.masters}
+    assert missing_by_path[str(missing_master)] is True
+    assert missing_by_path[str(present_master)] is False
+    [replica_result] = result.replicas
+    changes_by_path = {c.rel_path: c for c in replica_result.files}
+    assert changes_by_path["notes/a.txt"].category == "new"
+
+
+def test_baseline_entry_under_a_namespace_no_current_master_claims_reconciles_away_silently(
+    tmp_path,
+):
+    master = tmp_path / "master"
+    replica = tmp_path / "replica"
+    master.mkdir()
+    replica.mkdir()
+    (replica / "old-master").mkdir()
+    (replica / "old-master" / "stale.txt").write_text("leftover")
+    baseline = _baseline(
+        replica,
+        {"old-master/stale.txt": _baseline_entry_for(replica / "old-master" / "stale.txt")},
+    )
+
+    result = check(_rule(master, [replica]), baseline=baseline)
+
+    [replica_result] = result.replicas
+    assert replica_result.files == []
+    assert replica_result.walk_errors == []
+    # Reconciled away, not deleted: the physical file is left untouched.
+    assert (replica / "old-master" / "stale.txt").exists()
+
+
+def test_find_namespace_collisions_detects_two_rules_landing_at_the_same_spot(tmp_path):
+    replica = tmp_path / "replica"
+    rule_a = _rule(tmp_path / "a" / "skills", [replica], rule_id="a")
+    rule_b = _rule(tmp_path / "b" / "skills", [replica], rule_id="b")
+
+    collisions = find_namespace_collisions([rule_a, rule_b])
+
+    assert len(collisions) == 1
+    [collision] = collisions
+    assert collision.landing_path == "skills"
+    assert collision.replica_path == normalize_replica_path(str(replica))
+    assert set(collision.rule_ids) == {"a", "b"}
+
+
+def test_find_namespace_collisions_ignores_rules_with_no_shared_landing_spot(tmp_path):
+    rule_a = _rule(tmp_path / "skills", [tmp_path / "replica"], rule_id="a")
+    rule_b = _rule(tmp_path / "notes", [tmp_path / "replica"], rule_id="b")
+
+    assert find_namespace_collisions([rule_a, rule_b]) == []
+
+
+def test_find_namespace_collisions_treats_a_dir_and_file_master_of_the_same_name_as_colliding(
+    tmp_path,
+):
+    replica = tmp_path / "replica"
+    rule_a = _rule(tmp_path / "a" / "notes", [replica], rule_id="a")
+    rule_b = _rule(tmp_path / "b" / "notes", [replica], master_type="file", rule_id="b")
+
+    collisions = find_namespace_collisions([rule_a, rule_b])
+
+    assert len(collisions) == 1
+    assert collisions[0].landing_path == "notes"
+    assert set(collisions[0].rule_ids) == {"a", "b"}
+
+
+def test_find_namespace_collisions_ignores_a_lone_rule_owning_the_replica(tmp_path):
+    rule = _rule(tmp_path / "skills", [tmp_path / "replica"], rule_id="a")
+
+    assert find_namespace_collisions([rule]) == []
+
+
+def test_check_suppresses_rows_under_a_collided_namespace(tmp_path):
+    master_a = tmp_path / "a" / "skills"
+    master_b = tmp_path / "b" / "skills"
+    master_a.mkdir(parents=True)
+    master_b.mkdir(parents=True)
+    (master_a / "one.md").write_text("from a")
+    replica = tmp_path / "replica"
+    replica.mkdir()
+
+    rule_a = _rule(master_a, [replica], rule_id="a")
+    rule_b = _rule(master_b, [replica], rule_id="b")
+    collisions = find_namespace_collisions([rule_a, rule_b])
+
+    # Sanity: without the collision known, the row would ordinarily be reported.
+    [uncollided_result] = check(rule_a).replicas
+    assert uncollided_result.files != []
+
+    [replica_result] = check(rule_a, collisions=collisions).replicas
+    assert replica_result.files == []
+
+
+def test_check_suppression_is_scoped_to_the_colliding_replica_only(tmp_path):
+    master_a = tmp_path / "a" / "skills"
+    master_b = tmp_path / "b" / "skills"
+    master_a.mkdir(parents=True)
+    master_b.mkdir(parents=True)
+    (master_a / "one.md").write_text("from a")
+    shared_replica = tmp_path / "shared"
+    solo_replica = tmp_path / "solo"
+    shared_replica.mkdir()
+    solo_replica.mkdir()
+
+    rule_a = _rule(master_a, [shared_replica, solo_replica], rule_id="a")
+    rule_b = _rule(master_b, [shared_replica], rule_id="b")
+    collisions = find_namespace_collisions([rule_a, rule_b])
+
+    shared_result, solo_result = check(rule_a, collisions=collisions).replicas
+
+    assert shared_result.files == []
+    assert solo_result.files != []

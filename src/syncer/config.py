@@ -38,15 +38,22 @@ def normalize_replica_path(path: str) -> str:
     return os.path.normcase(os.path.normpath(os.path.abspath(path)))
 
 
-def _basename(path: str) -> str:
+def master_basename(path: str) -> str:
     return os.path.basename(os.path.normpath(path))
+
+
+def master_basename_key(path: str) -> str:
+    """A master's basename identity: what must be unique within a rule, and
+    what two rules' masters collide on inside a shared replica.
+    """
+    return os.path.normcase(master_basename(path))
 
 
 def default_rule_name(master: str, master_type: str) -> str:
     """The add-rule modal's pre-filled name: the master's basename, extension
     stripped for a file (a folder's basename has no extension to strip).
     """
-    basename = _basename(master)
+    basename = master_basename(master)
     if master_type == "file":
         return os.path.splitext(basename)[0]
     return basename
@@ -175,7 +182,7 @@ def _validate_rules(rules: list[SyncRule]) -> None:
             master_paths,
             DuplicateMasterError,
             "master basename used by more than one master in the same rule",
-            key=lambda path: os.path.normcase(_basename(path)),
+            key=master_basename_key,
         )
     _reject_duplicates(
         [rule.name for rule in rules],

@@ -3,9 +3,15 @@ import hashlib
 import os
 import re
 import stat
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
-from syncer.config import SyncRule, normalize_replica_path
+from syncer.config import (
+    Master,
+    SyncRule,
+    master_basename,
+    master_basename_key,
+    normalize_replica_path,
+)
 
 _IGNORED_DIR_NAMES = {".git", ".svn", ".hg", "__pycache__"}
 # "*.syncer-tmp-*": the executor's own overwrite temp files, orphaned only by a
@@ -84,11 +90,37 @@ class ReplicaCheckResult:
 
 
 @dataclass(frozen=True)
+class MasterStatus:
+    """One rule master's own presence, independent of its sibling masters —
+    spec.md's per-master **Master missing** (CONTEXT.md): a bad path or an
+    unmounted drive for one master must not block the rule's other masters.
+    """
+
+    master: Master
+    missing: bool
+
+
+@dataclass(frozen=True)
+class NamespaceCollision:
+    """Two or more rules landing a master at the same physical spot inside a
+    replica they share (CONTEXT.md's **Cross-rule namespace collision**) — a
+    config authoring fact, structural only, found by `find_namespace_collisions`
+    without touching the filesystem.
+    """
+
+    replica_path: str
+    # The shared basename these masters land at — a dir master's landing
+    # folder and a file master's landing filename collide on this alone
+    # (CONTEXT.md's Avoid line for this term), independent of either type.
+    landing_path: str
+    rule_ids: list[str]
+
+
+@dataclass(frozen=True)
 class CheckResult:
     rule_id: str
     rule_name: str
-    master_type: str
-    master_missing: bool
+    masters: list[MasterStatus] = field(default_factory=list)
     replicas: list[ReplicaCheckResult] = field(default_factory=list)
 
 
@@ -121,8 +153,8 @@ class _Side:
 
     def unlisted_detail(self, key: str, include_root: bool) -> str | None:
         """The listing error hiding `key` on this side, if a folder above it
-        couldn't be listed. The master's root is excluded by callers: that case
-        is reported rule-wide as master missing.
+        couldn't be listed. A master's root is excluded: that case is reported
+        per master as master missing (MasterStatus).
         """
         # normcase turns "/" into "\\" on Windows, so split on either.
         parts = key.replace("\\", "/").split("/")[:-1]
@@ -234,11 +266,12 @@ def _scan_tree(root: str) -> tuple[dict[str, _SideEntry], list[dict], dict[str, 
     return entries, walk_errors, unlisted_dirs
 
 
-def _scan_side(path: str, master_type: str, single_file_name: str) -> _Side:
+def _scan_side(path: str, master_type: str) -> _Side:
     exists = os.path.exists(path)
     if master_type == "file":
         entries = {}
         if exists:
+            single_file_name = master_basename(path)
             key = os.path.normcase(single_file_name)
             if os.path.isfile(path):
                 entries[key] = _file_entry(single_file_name, path)
@@ -255,6 +288,30 @@ def _scan_side(path: str, master_type: str, single_file_name: str) -> _Side:
 
 def _comparable_keys(side: _Side) -> set[str]:
     return {key for key, entry in side.entries.items() if entry.kind != "dir"}
+
+
+def _is_owned(masters_by_key: dict[str, Master], key: str) -> bool:
+    """Whether `key` — an already-normcased landing path — falls in the
+    namespace of one of `masters_by_key` (config data only, independent of
+    what's on disk): a file master's bare filename, or a dir master's landing
+    folder itself or anything under it. The landing folder's own key stays
+    owned so a file or junction sitting where that folder belongs is reported
+    as a type mismatch / unreadable, not silently dropped. A landing path no
+    *currently configured* master claims is left over from a master since
+    removed from the rule, which check() must reconcile away silently rather
+    than report (issue #21).
+    """
+    # normcase turns "/" into "\\" on Windows, so split on either.
+    head, sep, _ = key.replace("\\", "/").partition("/")
+    master = masters_by_key.get(head)
+    return master is not None and (master.type == "dir" or not sep)
+
+
+def _replica_error_in_scope(replica: str, error_path: str, masters_by_key: dict[str, Master]) -> bool:
+    if not error_path:
+        return True
+    rel_path = os.path.relpath(error_path, replica)
+    return rel_path == "." or _is_owned(masters_by_key, os.path.normcase(rel_path))
 
 
 def _entry_hash(
@@ -312,6 +369,43 @@ def _categorize_present_both(
         ],
         False,
     )
+
+
+def _scan_masters(masters: list[Master]) -> tuple[_Side, list[MasterStatus]]:
+    """Every rule master's scan, combined into one side keyed by landing path
+    (CONTEXT.md's **Replica** entry): a file master at its own bare filename,
+    a dir master under a subfolder named for its own basename — so a replica's
+    comparison doesn't care how many masters contributed to it. Config
+    guarantees master basenames are unique within a rule, so the per-master
+    entries can never collide once namespaced.
+    """
+    statuses = []
+    entries: dict[str, _SideEntry] = {}
+    walk_errors: list[dict] = []
+    unlisted_dirs: dict[str, str] = {}
+    for master in masters:
+        side = _scan_side(master.path, master.type)
+        missing = not side.exists or side.root_unlisted
+        statuses.append(MasterStatus(master=master, missing=missing))
+        walk_errors.extend(side.walk_errors)
+        if master.type == "file":
+            entries.update(side.entries)
+            continue
+        basename = master_basename(master.path)
+        prefix = f"{basename}/"
+        prefix_key = os.path.normcase(prefix)
+        if not missing:
+            # The landing folder itself, recorded like any subfolder so a file
+            # where it belongs in a replica is caught as a type mismatch.
+            entries[os.path.normcase(basename)] = _SideEntry(basename, "dir")
+        for key, entry in side.entries.items():
+            entries[prefix_key + key] = replace(entry, rel_path=prefix + entry.rel_path)
+        for key, message in side.unlisted_dirs.items():
+            # The master's own root ("") is already reported as its MasterStatus.
+            if key:
+                unlisted_dirs[prefix_key + key] = message
+    exists = not all(status.missing for status in statuses)
+    return _Side(entries, exists, walk_errors, unlisted_dirs), statuses
 
 
 @dataclass(frozen=True)
@@ -443,31 +537,64 @@ def _check_replica(
     )
 
 
-def check(rule: SyncRule, baseline=None, progress=None, cancel=None) -> CheckResult:
+def check(
+    rule: SyncRule,
+    baseline=None,
+    progress=None,
+    cancel=None,
+    collisions: list[NamespaceCollision] | None = None,
+) -> CheckResult:
     baseline = baseline or {}
-    single_file_name = os.path.basename(rule.master)
 
-    def scan(path: str) -> _Side:
-        return _scan_side(path, rule.master_type, single_file_name)
-
-    # The master is invariant across replicas: enumerated once per rule, and its
-    # file hashes memoised for the run, so an N-replica fan-out reads it once.
-    master_side = scan(rule.master)
+    # Every master is invariant across this rule's replicas: enumerated once,
+    # its file hashes memoised for the run, so an N-replica fan-out reads it once.
+    master_side, master_statuses = _scan_masters(rule.masters)
     master_keys = _comparable_keys(master_side)
     master_hashes: dict[str, str] = {}
+    masters_by_key = {master_basename_key(master.path): master for master in rule.masters}
+
+    # Basenames this rule must not report on in a given replica: a collision
+    # with another rule sharing that replica (CONTEXT.md's Cross-rule
+    # namespace collision) — state.json has no master dimension, so per-file
+    # rows here would be contradictory guesses (issue #21). Scoped per
+    # replica_path: a rule with several replicas may collide in only one.
+    blocked_by_replica: dict[str, set[str]] = {}
+    for collision in collisions or []:
+        if rule.id in collision.rule_ids:
+            blocked_by_replica.setdefault(collision.replica_path, set()).add(
+                os.path.normcase(collision.landing_path)
+            )
 
     plans = []
     for replica in rule.replicas:
-        replica_baseline = baseline.get(normalize_replica_path(replica), {})
+        replica_key = normalize_replica_path(replica)
+        replica_baseline = baseline.get(replica_key, {})
         baseline_by_key = {os.path.normcase(p): p for p in replica_baseline}
-        side = scan(replica)
+        side = _scan_side(replica, "dir")
+        blocked = blocked_by_replica.get(replica_key)
+        # A collided master is out of scope here as if it weren't in the rule.
+        in_scope = (
+            {k: m for k, m in masters_by_key.items() if k not in blocked} if blocked else masters_by_key
+        )
+        # The replica is walked whole, but it may hold other rules' landing
+        # paths or unrelated content: keep only listing errors at its root or
+        # inside a landing path this rule owns here.
+        side = replace(
+            side,
+            walk_errors=[
+                error
+                for error in side.walk_errors
+                if _replica_error_in_scope(replica, error["path"], in_scope)
+            ],
+        )
+        candidate_keys = master_keys | _comparable_keys(side) | set(baseline_by_key)
         plans.append(
             _ReplicaPlan(
                 replica=replica,
                 side=side,
                 baseline=replica_baseline,
                 baseline_by_key=baseline_by_key,
-                keys=sorted(master_keys | _comparable_keys(side) | set(baseline_by_key)),
+                keys=sorted(k for k in candidate_keys if _is_owned(in_scope, k)),
             )
         )
 
@@ -495,9 +622,29 @@ def check(rule: SyncRule, baseline=None, progress=None, cancel=None) -> CheckRes
     return CheckResult(
         rule_id=rule.id,
         rule_name=rule.name,
-        master_type=rule.master_type,
-        # Gone, or present but its root can't be listed: either way every file
-        # would otherwise read as master_deleted, so block it rule-wide.
-        master_missing=not master_side.exists or master_side.root_unlisted,
+        masters=master_statuses,
         replicas=replicas,
     )
+
+
+def find_namespace_collisions(rules: list[SyncRule]) -> list[NamespaceCollision]:
+    """Every landing path two or more rules would both claim inside a replica
+    they share (CONTEXT.md's Cross-rule namespace collision) — a structural
+    fact of the rules' configuration alone, with no filesystem walk needed.
+    """
+    slots: dict[tuple[str, str], NamespaceCollision] = {}
+    for rule in rules:
+        # Keyed on the bare basename: a filesystem entry named "notes"
+        # collides whether it's this rule's file or that rule's folder
+        # (CONTEXT.md's Avoid line for this term).
+        basenames = [master_basename(master.path) for master in rule.masters]
+        for replica in rule.replicas:
+            replica_key = normalize_replica_path(replica)
+            for basename in basenames:
+                slot = slots.setdefault(
+                    (replica_key, os.path.normcase(basename)),
+                    NamespaceCollision(replica_path=replica_key, landing_path=basename, rule_ids=[]),
+                )
+                if rule.id not in slot.rule_ids:
+                    slot.rule_ids.append(rule.id)
+    return [slot for slot in slots.values() if len(slot.rule_ids) >= 2]
