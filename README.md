@@ -4,8 +4,8 @@ A general-purpose, offline, Windows-only tool that keeps copies of files and fol
 a single canonical original.
 
 It exists because keeping the same content identical across many project directories by hand is
-error-prone. Point Syncer at one **master**, list the places it should be copied to, and run a
-**check** to see exactly what has drifted before anything is written.
+error-prone. Point Syncer at your **masters**, list the **replicas** they should land in, and run
+a **check** to see exactly what has drifted before anything is written.
 
 ## Status
 
@@ -15,9 +15,12 @@ spec area, worked roughly in order. Nothing is released yet.
 
 ## How it will work
 
-- **Master → replicas, one way.** A **sync rule** pairs one master (file or folder) with a list
-  of **replica** absolute paths. Sync is always one-way, master to replica — no merge, no reverse
-  push. One rule per syncable unit; each replica can take its own subset.
+- **Masters → replicas, one way.** A **sync rule** pairs one or more **masters** (each a file or
+  folder) with a list of **replica** absolute paths — every master in a rule syncs to every
+  replica in it. Sync is always one-way, master to replica — no merge, no reverse push. A
+  folder-type master lands under its own subfolder in the replica (named for the master's
+  basename) so several masters in one rule don't collide; a file-type master lands directly at
+  the replica path. A master or replica can be reused by more than one rule.
 - **Check before sync.** An on-demand **check** compares each master against its replicas by file
   content (not timestamps) and reports the **drift**: files the replica is missing, files that
   differ, and files the master has deleted. Nothing changes until you confirm.
@@ -25,6 +28,9 @@ spec area, worked roughly in order. Nothing is released yet.
   would lose those edits. Syncer calls this out distinctly from ordinary drift.
 - **Deletions are their own step.** Propagated deletions are shown as a separate category and
   confirmed separately from updates.
+- **Shared replicas are protected.** If two rules' masters would land at the same path inside a
+  replica they both target, sync is blocked for just that path in both rules until you rename a
+  master or stop sharing the replica.
 - **Review at any level.** A GUI shows check results as an expandable tree (rule → replica →
   folder → file); you can sync a whole rule or a single file.
 
@@ -54,8 +60,9 @@ or cloud sync · pulling upstream repos (done by hand).
 
 ## Build workflow
 
-Work is tracked as [GitHub issues](https://github.com/LydP/syncer/issues) `#1`–`#8`, one per
-`spec.md` section, worked roughly in issue-number order. Set up a dev environment with:
+Work is tracked as [GitHub issues](https://github.com/LydP/syncer/issues), worked roughly in
+issue-number order; check the tracker for current status rather than relying on numbers written
+here. Set up a dev environment with:
 
 ```
 python -m venv venv

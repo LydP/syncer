@@ -32,11 +32,11 @@ a ~250MB download.
 
 | Path | What |
 |------|------|
-| `src/syncer/` | Application source, src-layout. `storage.py` (issue `#1`) resolves `base_dir`, checks writability, and provisions the storage layout — see ADR 0001. `config.py` (issue `#2`) loads/saves/validates `config.toml`: `load_config`/`save_config`, uniqueness validation, atomic writes with rolling backups, and `ConfigStore` for reload / warn-before-clobber. |
+| `src/syncer/` | Application source, src-layout. `storage.py` resolves `base_dir`, checks writability, and provisions the storage layout — see ADR 0001. `config.py` loads/saves/validates `config.toml`: `SyncRule.masters` (a list of `Master{path, type}` — multi-master, multi-replica per rule), `load_config`/`save_config`, uniqueness validation (duplicate master basename/path within a rule, duplicate rule name across rules), atomic writes with rolling backups, and `ConfigStore` for reload / warn-before-clobber. |
 | `tests/` | Pytest suite, one `test_<module>.py` per `src/syncer/<module>.py`. |
 | `CONTEXT.md` | Domain glossary — the authoritative vocabulary. Read first. |
 | `docs/adr/` | Architecture Decision Records. Read any that touch your area; flag contradictions rather than silently overriding (`docs/agents/domain.md`). |
-| GitHub Issues (`gh issue list`) | **The issue tracker.** Active build-effort tickets `#1`–`#8`, one per spec area (scaffolding, config model, check engine, state model, sync executor, review UI, divergence UX, GUI/first-run). Conventions in `docs/agents/issue-tracker.md`. |
+| GitHub Issues (`gh issue list`) | **The issue tracker.** Original build-effort tickets `#1`–`#8` (scaffolding, config model, check engine, state model, sync executor, review UI, divergence UX, GUI/first-run) plus bugfixes `#9`–`#11` are closed. Current epic: `#12`, generalizing sync rules to multi-master/multi-replica, with sub-issues `#20`–`#25` (config schema, check engine, state model, sync executor/conflict resolution, review UI, GUI rule editor). Check `gh issue list --state all` for live status rather than trusting numbers written here. Conventions in `docs/agents/issue-tracker.md`. |
 | `.scratch/local-file-syncer/` | The **completed** planning effort — historical record, not an active tracker. `map.md` is the wayfinder map; `issues/` holds its resolved tickets; `spec.md` is the build-ready spec it produced. |
 | `.claude/skills/` | Project-local agent skills (grilling, domain-modeling, research, prototype, wayfinder, tdd, to-spec, to-tickets, setup-matt-pocock-skills, …). |
 
@@ -58,14 +58,22 @@ logic in the pure layer even when it's GUI-triggered, so it stays testable.
 **The three-way comparison model** (`check.py`, spec.md §5/§9) is the core domain logic: every
 file is compared across *baseline* (the last-known-synced content, from `state.json`), *master*,
 and *replica*, not just master-vs-replica — a two-way `filecmp.dircmp`-style compare can't express
-it (ticket `05`, noted again below). `check()` categorizes each file into one of ten
-categories (`in_sync`, `new`, `changed`, `master_deleted`, `replica_only`, `unreadable`,
-`no_baseline`, `diverged`, `both_changed`, `kept`); `review.py`'s `CATEGORY_BUCKET` is the single
-place that rolls those up into the four user-facing buckets (`safe` / `delete` / `conflict` /
-`context`) that drive what's tickable, bulk-syncable, or routed into the conflict-resolution
-dialog. A "kept" resolution (`conflict.apply_keep_replica`) stores `kept_master_hash` — the
-master's hash *at keep time* — so a later `check()` compares each side against its own keep-time
-hash instead of the stale baseline; don't reintroduce a plain baseline comparison for kept entries.
+it (ticket `05`, noted again below). A rule's `masters` list is each walked and namespaced into
+every replica in the rule — a folder-type master lands under its own `<basename>/` subfolder, a
+file-type master lands directly at its filename — and `master_missing` is evaluated per master, so
+one missing master blocks only its own namespace, not the whole replica. `check()` categorizes
+each file into one of ten categories (`in_sync`, `new`, `changed`, `master_deleted`,
+`replica_only`, `unreadable`, `no_baseline`, `diverged`, `both_changed`, `kept`); `review.py`'s
+`CATEGORY_BUCKET` is the single place that rolls those up into the four user-facing buckets
+(`safe` / `delete` / `conflict` / `context`) that drive what's tickable, bulk-syncable, or routed
+into the conflict-resolution dialog. A "kept" resolution (`conflict.apply_keep_replica`) stores
+`kept_master_hash` — the master's hash *at keep time* — so a later `check()` compares each side
+against its own keep-time hash instead of the stale baseline; don't reintroduce a plain baseline
+comparison for kept entries. Separately, **cross-rule namespace collision** detection is
+structural, not filesystem-based: given the full rule list, it flags any replica shared by 2+
+rules where masters from different rules would land at the same path, and blocks ordinary sync for
+just that path in every rule involved — there's no unlock, since the fix (rename a master, or stop
+sharing the replica) is fully in the user's control.
 
 **Cross-cutting conventions**, applied consistently across `storage.py`/`config.py`/`state.py`/
 `sync.py`:
@@ -90,16 +98,21 @@ tickets here — new work goes to GitHub issues.
 
 ## The active effort: building the tool
 
-Tracked as GitHub issues `#1`–`#8`, each scoped to a `spec.md` section — see
-`docs/agents/issue-tracker.md` for the `gh` conventions. No labels/dependencies are set on them
-yet; work roughly in issue-number order since later issues (executor, UI, divergence UX) build on
-earlier ones (scaffolding, config/state models, check engine). Use the standard `Development
-workflow` below per issue.
+Tracked as GitHub issues, each scoped to a `spec.md` section or, for later rework, a decision-map
+sub-issue — see `docs/agents/issue-tracker.md` for the `gh` conventions. Work roughly in
+issue-number order since later issues build on earlier ones. The original build (`#1`–`#8`) is
+closed; the active epic is `#12` (multi-master sync rules), whose sub-issues `#20`–`#25` cover
+config schema, check engine, state model, sync executor/conflict resolution, review UI, and the
+GUI rule editor, in that dependency order. Use the standard `Development workflow` below per
+issue.
 
 ## Settled design constraints (from `map.md` Notes — not open questions)
 
-One-way fan-out, master wins, no merge / no reverse push · one sync rule per syncable unit ·
-Python + PySide desktop GUI · on-demand **check** only (no filesystem watching) · Windows only ·
+One-way fan-out, master wins, no merge / no reverse push · a sync rule is a multi-master,
+multi-replica unit — every master in a rule syncs to every replica in it, and a master or replica
+may be shared across more than one rule (settled in issue `#12`, superseding the earlier
+one-master-per-rule model) · Python + PySide desktop GUI · on-demand **check** only (no filesystem
+watching) · Windows only ·
 content-based comparison (hashing), not timestamps · human-readable `config.toml` (user intent)
 plus a separate `state.json` (last-sync data), both GUI-managed · first-time provisioning of a
 missing replica handled like any other update · deletions propagate but are confirmed as their
