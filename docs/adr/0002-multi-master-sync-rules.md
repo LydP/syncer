@@ -21,5 +21,5 @@ The driving case is keeping Claude Code skill folders current: a project should 
 
 - Supersedes `spec.md` §2/§4's shipped-v1 constraints ("one master paired with the list of replicas... one rule per syncable unit"; "master paths unique across all rules"). `spec.md` stays as the historical record of the v1 build, not current.
 - `config.toml`'s `[[rule]]` shape, `check.py`'s three-way comparison, and `state.json`'s keying all need rework to add a master dimension — tracked in [Multi-master sync rules: decision map](https://github.com/LydP/syncer/issues/12), not resolved by this ADR alone.
-- Introduces a new conflict category (cross-rule master-basename collision, when two rules' masters collide by basename against a shared replica) not yet in `CONTEXT.md`'s Conflict taxonomy — detection and UX deferred to that map's tickets.
+- Introduces a new case (cross-rule master-basename collision, when two rules' masters collide by basename against a shared replica) not yet in `CONTEXT.md`'s taxonomy — detection and UX deferred to that map's tickets. **Update (issue #19):** resolved as **Cross-rule namespace collision**, modeled like `master_missing` rather than as a `Conflict` — see `CONTEXT.md`.
 - No migration was needed: no rules existed in `config.toml`/`state.json` at the time of this decision.
