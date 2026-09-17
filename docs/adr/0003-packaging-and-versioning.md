@@ -10,7 +10,7 @@ Syncer is distributed as a Nuitka standalone (onedir) build: a folder containing
 `.exe` plus its dependencies, zipped and attached to a GitHub Release — never a single-file exe
 or an OS installer. The version lives in exactly one place, `pyproject.toml`'s `version` field;
 the build reads it at build time to embed it as the `.exe`'s file/product version metadata (via
-Nuitka's `--windows-file-version`/`--windows-product-version` flags), and the running app reads
+Nuitka's version-metadata flags — see `scripts/build.py`), and the running app reads
 it at runtime via `importlib.metadata` for display (the main window's title bar). Versions are
 bumped manually, using SemVer loosely (no strict enforcement of what counts as "breaking"), never
 automatically or tied to issue/epic boundaries. A release is cut by tagging the commit

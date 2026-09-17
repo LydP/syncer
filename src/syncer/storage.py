@@ -41,12 +41,12 @@ class StorageLayout:
 
 
 def resolve_base_dir() -> Path:
-    """Locate `base_dir`: beside the executable when frozen, else the project root.
+    """Locate `base_dir`: beside the executable when packaged, else the project root.
 
-    ADR 0001 permits no fallback, so an unfrozen run that is not inside a source
+    ADR 0001 permits no fallback, so a source run that is not inside a source
     tree is a hard error rather than an arbitrary directory.
     """
-    if getattr(sys, "frozen", False):
+    if _is_standalone_build():
         return Path(sys.executable).resolve().parent
     module_path = Path(__file__).resolve()
     for candidate in module_path.parents:
@@ -54,8 +54,24 @@ def resolve_base_dir() -> Path:
             return candidate
     raise BaseDirNotFoundError(
         f"no Syncer {PROJECT_ROOT_MARKER} found above {module_path}; run Syncer "
-        "from a source tree or as a frozen executable"
+        "from a source tree or as a packaged executable"
     )
+
+
+def _is_standalone_build() -> bool:
+    """True only inside a Nuitka standalone build, where `sys.executable` is the
+    packaged .exe sitting in the distribution folder (ADR 0003).
+
+    Nuitka never sets ``sys.frozen`` -- that is a PyInstaller/cx_Freeze
+    convention, and ADR 0003 settled on Nuitka. Its own marker is
+    ``__compiled__``, injected into every compiled module's globals, but that
+    marker alone is not enough: it is present in non-standalone compiles too,
+    where ``sys.executable`` is still the interpreter. Keying off the marker's
+    presence would make an arbitrary directory `base_dir` there, silently,
+    which is exactly what ADR 0001's no-fallback rule exists to prevent.
+    """
+    compiled = globals().get("__compiled__")
+    return compiled is not None and compiled.standalone
 
 
 def _is_syncer_project_root(candidate: Path) -> bool:

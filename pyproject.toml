@@ -16,6 +16,9 @@ gui = [
 dev = [
     "pytest",
 ]
+build = [
+    "nuitka",
+]
 
 [build-system]
 requires = ["hatchling"]

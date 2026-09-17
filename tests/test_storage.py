@@ -1,4 +1,6 @@
 import sys
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,25 +16,47 @@ from syncer.storage import (
 )
 
 
-def test_resolve_base_dir_uses_project_root_when_not_frozen():
+def _fake_compiled_exe(tmp_path, monkeypatch, *, standalone: bool) -> Path:
+    """Stand in for a Nuitka build: an exe on disk plus the `__compiled__` marker."""
+    fake_exe = tmp_path / "install" / "syncer.exe"
+    fake_exe.parent.mkdir()
+    fake_exe.touch()
+    monkeypatch.setitem(
+        storage.__dict__, "__compiled__", SimpleNamespace(standalone=standalone)
+    )
+    monkeypatch.setattr(sys, "executable", str(fake_exe))
+    return fake_exe
+
+
+def test_resolve_base_dir_uses_project_root_when_running_from_source():
     base_dir = resolve_base_dir()
 
     assert (base_dir / "pyproject.toml").is_file()
 
 
-def test_resolve_base_dir_uses_executable_dir_when_frozen(tmp_path, monkeypatch):
-    fake_exe = tmp_path / "install" / "syncer.exe"
-    fake_exe.parent.mkdir()
-    fake_exe.touch()
-    monkeypatch.setattr(sys, "frozen", True, raising=False)
-    monkeypatch.setattr(sys, "executable", str(fake_exe))
+def test_resolve_base_dir_uses_executable_dir_when_nuitka_standalone(tmp_path, monkeypatch):
+    fake_exe = _fake_compiled_exe(tmp_path, monkeypatch, standalone=True)
 
     base_dir = resolve_base_dir()
 
     assert base_dir == fake_exe.parent
 
 
-def test_resolve_base_dir_raises_when_unfrozen_and_outside_a_source_tree(monkeypatch):
+def test_resolve_base_dir_ignores_executable_dir_when_compiled_but_not_standalone(
+    tmp_path, monkeypatch
+):
+    # A non-standalone compile still defines __compiled__, but sys.executable is
+    # the interpreter -- adopting its directory would silently make an arbitrary
+    # directory `base_dir`, which ADR 0001 forbids.
+    fake_exe = _fake_compiled_exe(tmp_path, monkeypatch, standalone=False)
+
+    base_dir = resolve_base_dir()
+
+    assert base_dir != fake_exe.parent
+    assert (base_dir / "pyproject.toml").is_file()
+
+
+def test_resolve_base_dir_raises_when_outside_a_source_tree(monkeypatch):
     monkeypatch.setattr(storage, "PROJECT_ROOT_MARKER", "not-a-real-marker.toml")
 
     with pytest.raises(BaseDirNotFoundError):
