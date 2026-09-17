@@ -8,8 +8,9 @@ from dataclasses import dataclass, field, replace
 from syncer.config import (
     Master,
     SyncRule,
+    is_owned_landing_path,
     master_basename,
-    master_basename_key,
+    masters_by_basename_key,
     normalize_replica_path,
 )
 
@@ -290,28 +291,11 @@ def _comparable_keys(side: _Side) -> set[str]:
     return {key for key, entry in side.entries.items() if entry.kind != "dir"}
 
 
-def _is_owned(masters_by_key: dict[str, Master], key: str) -> bool:
-    """Whether `key` — an already-normcased landing path — falls in the
-    namespace of one of `masters_by_key` (config data only, independent of
-    what's on disk): a file master's bare filename, or a dir master's landing
-    folder itself or anything under it. The landing folder's own key stays
-    owned so a file or junction sitting where that folder belongs is reported
-    as a type mismatch / unreadable, not silently dropped. A landing path no
-    *currently configured* master claims is left over from a master since
-    removed from the rule, which check() must reconcile away silently rather
-    than report (issue #21).
-    """
-    # normcase turns "/" into "\\" on Windows, so split on either.
-    head, sep, _ = key.replace("\\", "/").partition("/")
-    master = masters_by_key.get(head)
-    return master is not None and (master.type == "dir" or not sep)
-
-
 def _replica_error_in_scope(replica: str, error_path: str, masters_by_key: dict[str, Master]) -> bool:
     if not error_path:
         return True
     rel_path = os.path.relpath(error_path, replica)
-    return rel_path == "." or _is_owned(masters_by_key, os.path.normcase(rel_path))
+    return rel_path == "." or is_owned_landing_path(masters_by_key, rel_path)
 
 
 def _entry_hash(
@@ -551,7 +535,7 @@ def check(
     master_side, master_statuses = _scan_masters(rule.masters)
     master_keys = _comparable_keys(master_side)
     master_hashes: dict[str, str] = {}
-    masters_by_key = {master_basename_key(master.path): master for master in rule.masters}
+    masters_by_key = masters_by_basename_key(rule.masters)
 
     # Basenames this rule must not report on in a given replica: a collision
     # with another rule sharing that replica (CONTEXT.md's Cross-rule
@@ -594,7 +578,7 @@ def check(
                 side=side,
                 baseline=replica_baseline,
                 baseline_by_key=baseline_by_key,
-                keys=sorted(k for k in candidate_keys if _is_owned(in_scope, k)),
+                keys=sorted(k for k in candidate_keys if is_owned_landing_path(in_scope, k)),
             )
         )
 

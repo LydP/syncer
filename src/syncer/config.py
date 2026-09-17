@@ -92,6 +92,28 @@ class Config:
     rules: list[SyncRule] = field(default_factory=list)
 
 
+def masters_by_basename_key(masters: list[Master]) -> dict[str, Master]:
+    return {master_basename_key(master.path): master for master in masters}
+
+
+def is_owned_landing_path(masters_by_key: dict[str, Master], rel_path: str) -> bool:
+    """Whether `rel_path` — a replica-relative landing path, matched
+    case-insensitively — falls in the namespace of one of `masters_by_key`
+    (config data only, independent of what's on disk): a file master's bare
+    filename, or a dir master's landing folder itself or anything under it.
+    The landing folder's own path stays owned so a file or junction sitting
+    where that folder belongs is reported as a type mismatch / unreadable,
+    not silently dropped. A landing path no *currently configured* master
+    claims is left over from a master since removed from the rule, which
+    check() reconciles away silently (issue #21) and reconcile_with_config
+    purges from the baseline (issue #22).
+    """
+    # normcase turns "/" into "\\" on Windows, so split on either.
+    head, sep, _ = os.path.normcase(rel_path).replace("\\", "/").partition("/")
+    master = masters_by_key.get(head)
+    return master is not None and (master.type == "dir" or not sep)
+
+
 def _rule_name_key(name: str) -> str:
     return name.casefold()
 

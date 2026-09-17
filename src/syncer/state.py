@@ -6,7 +6,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from syncer.check import HASH_ALGO, BaselineEntry
-from syncer.config import Config, normalize_replica_path
+from syncer.config import (
+    Config,
+    is_owned_landing_path,
+    masters_by_basename_key,
+    normalize_replica_path,
+)
 from syncer.storage import atomic_write_bytes, utc_file_stamp
 
 STATE_VERSION = 1
@@ -173,20 +178,35 @@ def merge_replica_entries(
 
 def reconcile_with_config(state: State, config: Config) -> State:
     """Drop any rule_id/replica-path entry no longer present in `config` —
-    a deleted rule, or a replica removed from a surviving rule.
+    a deleted rule, or a replica removed from a surviving rule — and any
+    surviving replica's file entries under a master since removed from its
+    rule, so no stale baseline lingers for content nothing produces anymore.
     """
     configured = {
-        rule.id: {normalize_replica_path(replica) for replica in rule.replicas}
+        rule.id: (
+            {normalize_replica_path(replica) for replica in rule.replicas},
+            masters_by_basename_key(rule.masters),
+        )
         for rule in config.rules
     }
-    return replace(
-        state,
-        rules={
-            rule_id: {p: r for p, r in replicas.items() if p in configured[rule_id]}
-            for rule_id, replicas in state.rules.items()
-            if rule_id in configured
-        },
-    )
+    rules = {}
+    for rule_id, replicas in state.rules.items():
+        if rule_id not in configured:
+            continue
+        replica_paths, masters_by_key = configured[rule_id]
+        rules[rule_id] = {
+            p: replace(
+                r,
+                files={
+                    rel_path: entry
+                    for rel_path, entry in r.files.items()
+                    if is_owned_landing_path(masters_by_key, rel_path)
+                },
+            )
+            for p, r in replicas.items()
+            if p in replica_paths
+        }
+    return replace(state, rules=rules)
 
 
 def reconcile_and_save(state_path: Path, state: State, config: Config) -> State:

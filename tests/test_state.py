@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import pytest
 
 from syncer.check import BaselineEntry
-from syncer.config import Config, SyncRule
+from syncer.config import Config, Master, SyncRule
 from syncer.state import (
     ReplicaState,
     State,
@@ -23,6 +23,15 @@ EMPTY_STATE = State(version=1, hash_algo="sha256", rules={})
 
 def _state(rules):
     return State(version=1, hash_algo="sha256", rules=rules)
+
+
+def _config(*masters):
+    return Config(
+        version=1,
+        rules=[
+            SyncRule(id="rule-1", name="kept rule", masters=list(masters), replicas=[r"C:\A\Replica"])
+        ],
+    )
 
 
 def test_load_state_missing_file_returns_empty_state(layout):
@@ -343,18 +352,7 @@ def test_merge_replica_entries_replaces_entry_differing_only_by_case():
 
 
 def test_reconcile_with_config_drops_rules_and_replicas_no_longer_configured():
-    config = Config(
-        version=1,
-        rules=[
-            SyncRule(
-                id="rule-1",
-                name="kept rule",
-                master="m",
-                master_type="dir",
-                replicas=[r"C:\A\Replica"],
-            )
-        ],
-    )
+    config = _config(Master(path="m", type="dir"))
     state = _state(
         {
             "rule-1": {
@@ -369,6 +367,36 @@ def test_reconcile_with_config_drops_rules_and_replicas_no_longer_configured():
 
     assert reconciled == _state(
         {"rule-1": {r"c:\a\replica": ReplicaState(last_sync="x", files={})}}
+    )
+
+
+def test_reconcile_with_config_purges_a_removed_masters_namespaced_entries():
+    config = _config(Master(path="m-kept", type="dir"))
+    state = _state(
+        {
+            "rule-1": {
+                r"c:\a\replica": ReplicaState(
+                    last_sync="x",
+                    files={
+                        "m-kept/SKILL.md": BaselineEntry(hash="a", size=1, mtime=1.0),
+                        "m-removed/notes.txt": BaselineEntry(hash="b", size=2, mtime=2.0),
+                    },
+                )
+            }
+        }
+    )
+
+    reconciled = reconcile_with_config(state, config)
+
+    assert reconciled == _state(
+        {
+            "rule-1": {
+                r"c:\a\replica": ReplicaState(
+                    last_sync="x",
+                    files={"m-kept/SKILL.md": BaselineEntry(hash="a", size=1, mtime=1.0)},
+                )
+            }
+        }
     )
 
 
