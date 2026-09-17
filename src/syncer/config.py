@@ -19,11 +19,15 @@ class ConfigError(SyncerError):
 
 
 class DuplicateMasterError(SyncerError):
-    pass
+    """Two masters in the same rule share a basename (they'd land on the same path)."""
 
 
-class DuplicateReplicaError(SyncerError):
-    pass
+class DuplicateMasterPathError(SyncerError):
+    """Two masters in the same rule share a path."""
+
+
+class DuplicateRuleNameError(SyncerError):
+    """Two rules share a name (case-insensitively)."""
 
 
 class ConfigClobberError(SyncerError):
@@ -34,11 +38,15 @@ def normalize_replica_path(path: str) -> str:
     return os.path.normcase(os.path.normpath(os.path.abspath(path)))
 
 
+def _basename(path: str) -> str:
+    return os.path.basename(os.path.normpath(path))
+
+
 def default_rule_name(master: str, master_type: str) -> str:
     """The add-rule modal's pre-filled name: the master's basename, extension
     stripped for a file (a folder's basename has no extension to strip).
     """
-    basename = os.path.basename(os.path.normpath(master))
+    basename = _basename(master)
     if master_type == "file":
         return os.path.splitext(basename)[0]
     return basename
@@ -57,11 +65,16 @@ def abs_path(root: str, master_type: str, rel_path: str) -> str:
 
 
 @dataclass(frozen=True)
+class Master:
+    path: str
+    type: str
+
+
+@dataclass(frozen=True)
 class SyncRule:
     id: str
     name: str
-    master: str
-    master_type: str
+    masters: list[Master]
     replicas: list[str] = field(default_factory=list)
     ignore: list[str] = field(default_factory=list)
 
@@ -72,83 +85,104 @@ class Config:
     rules: list[SyncRule] = field(default_factory=list)
 
 
-def _find_path_conflict(
-    config: Config,
-    path: str,
-    paths_of: Callable[[SyncRule], list[str]],
-    exclude_rule_id: str | None,
+def _rule_name_key(name: str) -> str:
+    return name.casefold()
+
+
+def find_name_conflict(
+    config: Config, name: str, *, exclude_rule_id: str | None = None
 ) -> SyncRule | None:
-    target = normalize_replica_path(path)
+    """The other rule (if any) already using `name`, case-insensitively.
+
+    Non-raising counterpart to load_config's DuplicateRuleNameError, for the
+    add/edit-rule modal's inline validation.
+    """
+    target = _rule_name_key(name)
     for rule in config.rules:
-        if rule.id != exclude_rule_id and any(
-            normalize_replica_path(p) == target for p in paths_of(rule)
-        ):
+        if rule.id != exclude_rule_id and _rule_name_key(rule.name) == target:
             return rule
     return None
 
 
-def find_master_conflict(
-    config: Config, master: str, *, exclude_rule_id: str | None = None
-) -> SyncRule | None:
-    """The other rule (if any) already using `master` as its master path.
-
-    Non-raising counterpart to load_config's DuplicateMasterError, for the
-    add/edit-rule modal's inline per-row validation.
-    """
-    return _find_path_conflict(config, master, lambda rule: [rule.master], exclude_rule_id)
-
-
-def find_replica_conflict(
-    config: Config, replica: str, *, exclude_rule_id: str | None = None
-) -> SyncRule | None:
-    """The other rule (if any) already using `replica` as one of its replica paths."""
-    return _find_path_conflict(config, replica, lambda rule: rule.replicas, exclude_rule_id)
-
-
-def _require_str(raw_rule: dict, key: str) -> str:
-    value = raw_rule.get(key)
+def _require_str(table: dict, key: str) -> str:
+    value = table.get(key)
     if not isinstance(value, str):
-        raise ConfigError(f"rule key {key!r} must be a string, got {value!r}")
+        raise ConfigError(f"key {key!r} must be a string, got {value!r}")
     return value
 
 
-def _require_str_list(raw_rule: dict, key: str) -> list[str]:
-    value = raw_rule.get(key, [])
+def _require_str_list(table: dict, key: str) -> list[str]:
+    value = table.get(key, [])
     if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
-        raise ConfigError(f"rule key {key!r} must be a list of strings, got {value!r}")
+        raise ConfigError(f"key {key!r} must be a list of strings, got {value!r}")
     return value
+
+
+def _parse_master(raw_master: object) -> Master:
+    if not isinstance(raw_master, dict):
+        raise ConfigError(f"each rule's 'masters' entry must be a table, got {raw_master!r}")
+    master_type = _require_str(raw_master, "type")
+    if master_type not in MASTER_TYPES:
+        raise ConfigError(
+            f"master key 'type' must be one of {MASTER_TYPES}, got {master_type!r}"
+        )
+    return Master(path=_require_str(raw_master, "path"), type=master_type)
 
 
 def _parse_rule(raw_rule: object) -> SyncRule:
     if not isinstance(raw_rule, dict):
         raise ConfigError(f"each [[rule]] must be a table, got {raw_rule!r}")
-    master_type = _require_str(raw_rule, "master_type")
-    if master_type not in MASTER_TYPES:
-        raise ConfigError(
-            f"rule key 'master_type' must be one of {MASTER_TYPES}, got {master_type!r}"
-        )
+    raw_masters = raw_rule.get("masters")
+    if not isinstance(raw_masters, list):
+        raise ConfigError(f"rule key 'masters' must be a list of tables, got {raw_masters!r}")
     return SyncRule(
         id=_require_str(raw_rule, "id"),
         name=_require_str(raw_rule, "name"),
-        master=_require_str(raw_rule, "master"),
-        master_type=master_type,
+        masters=[_parse_master(raw_master) for raw_master in raw_masters],
         replicas=_require_str_list(raw_rule, "replicas"),
         ignore=_require_str_list(raw_rule, "ignore"),
     )
 
 
-def _reject_duplicate_paths(
-    paths: list[str],
+def _reject_duplicates(
+    items: list[str],
     error_cls: type[SyncerError],
-    role: str,
-    key: Callable[[str], str] = lambda path: path,
+    message: str,
+    key: Callable[[str], str],
 ) -> None:
     seen = set()
-    for path in paths:
-        identity = key(path)
+    for item in items:
+        identity = key(item)
         if identity in seen:
-            raise error_cls(f"{role} path used by more than one rule: {path}")
+            raise error_cls(f"{message}: {item}")
         seen.add(identity)
+
+
+def _validate_rules(rules: list[SyncRule]) -> None:
+    for rule in rules:
+        if not rule.masters:
+            raise ConfigError(f"rule {rule.id!r} must have at least one master")
+        master_paths = [master.path for master in rule.masters]
+        # Path check first: equal paths always share a basename, so the
+        # basename check would otherwise shadow DuplicateMasterPathError.
+        _reject_duplicates(
+            master_paths,
+            DuplicateMasterPathError,
+            "master path used by more than one master in the same rule",
+            key=normalize_replica_path,
+        )
+        _reject_duplicates(
+            master_paths,
+            DuplicateMasterError,
+            "master basename used by more than one master in the same rule",
+            key=lambda path: os.path.normcase(_basename(path)),
+        )
+    _reject_duplicates(
+        [rule.name for rule in rules],
+        DuplicateRuleNameError,
+        "rule name used by more than one rule",
+        key=_rule_name_key,
+    )
 
 
 def load_config(config_path: Path) -> Config:
@@ -164,18 +198,7 @@ def load_config(config_path: Path) -> Config:
     if not isinstance(raw_rules, list):
         raise ConfigError(f"{config_path}: 'rule' must be an array of [[rule]] tables")
     rules = [_parse_rule(raw_rule) for raw_rule in raw_rules]
-    _reject_duplicate_paths(
-        [rule.master for rule in rules],
-        DuplicateMasterError,
-        "master",
-        key=normalize_replica_path,
-    )
-    _reject_duplicate_paths(
-        [replica for rule in rules for replica in rule.replicas],
-        DuplicateReplicaError,
-        "replica",
-        key=normalize_replica_path,
-    )
+    _validate_rules(rules)
     return Config(version=version, rules=rules)
 
 
@@ -202,6 +225,7 @@ def _prune_old_backups(backups_dir: Path) -> None:
 
 
 def save_config(config_path: Path, config: Config, backups_dir: Path) -> None:
+    _validate_rules(config.rules)
     # Back up whatever save is about to destroy, not what it just wrote — the
     # latter is already sitting live in config_path with nothing at risk.
     # Otherwise a hand-edit made between loads is overwritten with no backup
@@ -263,5 +287,10 @@ class ConfigStore:
             save_config(self._config_path, config, self._backups_dir)
         finally:
             # Record our own write even if the first-save backup fails after
-            # os.replace, so the next save isn't mistaken for a clobber.
-            self._loaded_mtime = self._current_mtime()
+            # os.replace, so the next save isn't mistaken for a clobber. A save
+            # that wrote nothing (e.g. rejected by validation) against a file
+            # that has since vanished must keep the old mtime, or load() would
+            # mistake the vanished file for a first run.
+            current_mtime = self._current_mtime()
+            if current_mtime is not None:
+                self._loaded_mtime = current_mtime

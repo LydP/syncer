@@ -9,12 +9,13 @@ from syncer.config import (
     ConfigError,
     ConfigStore,
     DuplicateMasterError,
-    DuplicateReplicaError,
+    DuplicateMasterPathError,
+    DuplicateRuleNameError,
     MAX_CONFIG_BACKUPS,
+    Master,
     SyncRule,
     default_rule_name,
-    find_master_conflict,
-    find_replica_conflict,
+    find_name_conflict,
     load_config,
     normalize_replica_path,
     save_config,
@@ -23,14 +24,15 @@ from syncer.config import (
 CONFIG_HEADER = "version = 1\n\n[settings]\n\n"
 
 
-def _rule_toml(rule_id, master, replicas):
+def _rule_toml(rule_id, masters, replicas=(), name=None):
+    """`masters` is a list of (path, type) pairs."""
+    masters_toml = ", ".join(f"{{ path = '{path}', type = '{type_}' }}" for path, type_ in masters)
     replicas_toml = ", ".join(f"'{r}'" for r in replicas)
     return (
         "[[rule]]\n"
         f'id = "{rule_id}"\n'
-        f'name = "{rule_id}"\n'
-        f"master = '{master}'\n"
-        'master_type = "dir"\n'
+        f'name = "{name or rule_id}"\n'
+        f"masters = [{masters_toml}]\n"
         f"replicas = [{replicas_toml}]\n"
         "ignore = []\n"
     )
@@ -48,46 +50,27 @@ def test_default_rule_name_keeps_full_basename_for_a_dir_master():
     assert default_rule_name(r"C:\Projects\my-skills", "dir") == "my-skills"
 
 
-def _rule(id, master, replicas, master_type="dir"):
-    return SyncRule(id=id, name=id, master=master, master_type=master_type, replicas=replicas)
+def _rule(id, *masters, name=None):
+    return SyncRule(id=id, name=name or id, masters=list(masters), replicas=[])
 
 
-def test_find_master_conflict_returns_none_when_no_other_rule_uses_the_path():
-    config = Config(version=1, rules=[_rule("r1", r"C:\a", [])])
+def test_find_name_conflict_returns_none_when_no_other_rule_uses_the_name():
+    config = Config(version=1, rules=[_rule("r1", Master(r"C:\a", "dir"), name="alpha")])
 
-    assert find_master_conflict(config, r"C:\b") is None
+    assert find_name_conflict(config, "beta") is None
 
 
-def test_find_master_conflict_returns_the_conflicting_rule():
-    other = _rule("r1", r"C:\shared", [])
+def test_find_name_conflict_returns_the_conflicting_rule():
+    other = _rule("r1", Master(r"C:\a", "dir"), name="shared-name")
     config = Config(version=1, rules=[other])
 
-    assert find_master_conflict(config, r"C:\SHARED") is other
+    assert find_name_conflict(config, "Shared-Name") is other
 
 
-def test_find_master_conflict_excludes_the_given_rule_id():
-    config = Config(version=1, rules=[_rule("r1", r"C:\shared", [])])
+def test_find_name_conflict_excludes_the_given_rule_id():
+    config = Config(version=1, rules=[_rule("r1", Master(r"C:\a", "dir"), name="shared-name")])
 
-    assert find_master_conflict(config, r"C:\shared", exclude_rule_id="r1") is None
-
-
-def test_find_replica_conflict_returns_none_when_no_other_rule_uses_the_path():
-    config = Config(version=1, rules=[_rule("r1", r"C:\a", [r"C:\a-replica"])])
-
-    assert find_replica_conflict(config, r"C:\b-replica") is None
-
-
-def test_find_replica_conflict_returns_the_conflicting_rule():
-    other = _rule("r1", r"C:\a", [r"C:\shared-replica"])
-    config = Config(version=1, rules=[other])
-
-    assert find_replica_conflict(config, r"C:\SHARED-REPLICA") is other
-
-
-def test_find_replica_conflict_excludes_the_given_rule_id():
-    config = Config(version=1, rules=[_rule("r1", r"C:\a", [r"C:\shared-replica"])])
-
-    assert find_replica_conflict(config, r"C:\shared-replica", exclude_rule_id="r1") is None
+    assert find_name_conflict(config, "shared-name", exclude_rule_id="r1") is None
 
 
 def test_normalize_replica_path_resolves_relative_segments_and_case():
@@ -110,8 +93,7 @@ def test_load_config_parses_a_rule(layout):
         CONFIG_HEADER + "[[rule]]\n"
         'id = "11111111-1111-4111-8111-111111111111"\n'
         'name = "cursor-rules skill"\n'
-        r"master = 'C:\MyStuff\skills\cursor-rules'" "\n"
-        'master_type = "dir"\n'
+        "masters = [{ path = 'C:\\MyStuff\\skills\\cursor-rules', type = 'dir' }]\n"
         r"replicas = ['C:\ProjectA\.claude\skills\cursor-rules']" "\n"
         "ignore = []\n"
     )
@@ -122,56 +104,133 @@ def test_load_config_parses_a_rule(layout):
     rule = config.rules[0]
     assert rule.id == "11111111-1111-4111-8111-111111111111"
     assert rule.name == "cursor-rules skill"
-    assert rule.master == r"C:\MyStuff\skills\cursor-rules"
-    assert rule.master_type == "dir"
+    assert rule.masters == [Master(path=r"C:\MyStuff\skills\cursor-rules", type="dir")]
     assert rule.replicas == [r"C:\ProjectA\.claude\skills\cursor-rules"]
     assert rule.ignore == []
 
 
-def test_load_config_rejects_duplicate_master_across_rules(layout):
+def test_load_config_parses_a_rule_with_several_masters(layout):
+    _write_config(
+        layout.config_path,
+        _rule_toml(
+            "11111111-1111-4111-8111-111111111111",
+            [(r"C:\MyStuff\skills\wayfinder", "dir"), (r"C:\MyStuff\resume.docx", "file")],
+        ),
+    )
+
+    config = load_config(layout.config_path)
+
+    assert config.rules[0].masters == [
+        Master(path=r"C:\MyStuff\skills\wayfinder", type="dir"),
+        Master(path=r"C:\MyStuff\resume.docx", type="file"),
+    ]
+
+
+def test_load_config_allows_the_same_master_path_across_rules(layout):
     shared_master = r"C:\MyStuff\skills\cursor-rules"
     _write_config(
         layout.config_path,
         _rule_toml(
             "11111111-1111-4111-8111-111111111111",
-            shared_master,
+            [(shared_master, "dir")],
             [r"C:\ProjectA\.claude\skills\cursor-rules"],
+            name="rule-a",
         ),
         _rule_toml(
             "22222222-2222-4222-8222-222222222222",
-            shared_master,
+            [(shared_master, "dir")],
             [r"C:\ProjectB\.claude\skills\cursor-rules"],
+            name="rule-b",
         ),
     )
 
-    with pytest.raises(DuplicateMasterError, match=re.escape(shared_master)):
-        load_config(layout.config_path)
+    config = load_config(layout.config_path)
+
+    assert len(config.rules) == 2
 
 
-@pytest.mark.parametrize(
-    "second_replica",
-    [
-        r"C:\ProjectA\.claude\skills\cursor-rules",
-        r"c:\PROJECTA\.claude\skills\CURSOR-RULES",
-    ],
-    ids=["exact", "different-case"],
-)
-def test_load_config_rejects_duplicate_replica_across_rules(layout, second_replica):
+def test_load_config_allows_the_same_replica_path_across_rules(layout):
+    shared_replica = r"C:\ProjectA\.claude\skills\cursor-rules"
     _write_config(
         layout.config_path,
         _rule_toml(
             "11111111-1111-4111-8111-111111111111",
-            r"C:\MyStuff\skills\cursor-rules",
-            [r"C:\ProjectA\.claude\skills\cursor-rules"],
+            [(r"C:\MyStuff\skills\cursor-rules", "dir")],
+            [shared_replica],
+            name="rule-a",
         ),
         _rule_toml(
             "22222222-2222-4222-8222-222222222222",
-            r"C:\MyStuff\skills\other-skill",
-            [second_replica],
+            [(r"C:\MyStuff\skills\other-skill", "dir")],
+            [shared_replica],
+            name="rule-b",
         ),
     )
 
-    with pytest.raises(DuplicateReplicaError, match=re.escape(second_replica)):
+    config = load_config(layout.config_path)
+
+    assert len(config.rules) == 2
+
+
+@pytest.mark.parametrize(
+    "second_name",
+    ["shared-name", "SHARED-NAME"],
+    ids=["exact", "different-case"],
+)
+def test_load_config_rejects_duplicate_rule_name_across_rules(layout, second_name):
+    _write_config(
+        layout.config_path,
+        _rule_toml(
+            "11111111-1111-4111-8111-111111111111",
+            [(r"C:\MyStuff\skills\cursor-rules", "dir")],
+            name="shared-name",
+        ),
+        _rule_toml(
+            "22222222-2222-4222-8222-222222222222",
+            [(r"C:\MyStuff\skills\other-skill", "dir")],
+            name=second_name,
+        ),
+    )
+
+    with pytest.raises(DuplicateRuleNameError, match=re.escape(second_name)):
+        load_config(layout.config_path)
+
+
+@pytest.mark.parametrize(
+    "second_master",
+    [r"C:\MyStuff\skills\cursor-rules", "c:\\mystuff\\SKILLS\\cursor-rules\\"],
+    ids=["exact", "different-case-and-trailing-slash"],
+)
+def test_load_config_rejects_duplicate_master_path_within_a_rule(layout, second_master):
+    _write_config(
+        layout.config_path,
+        _rule_toml(
+            "11111111-1111-4111-8111-111111111111",
+            [(r"C:\MyStuff\skills\cursor-rules", "dir"), (second_master, "dir")],
+        ),
+    )
+
+    with pytest.raises(DuplicateMasterPathError, match=re.escape(second_master)):
+        load_config(layout.config_path)
+
+
+def test_load_config_rejects_duplicate_master_basename_within_a_rule(layout):
+    _write_config(
+        layout.config_path,
+        _rule_toml(
+            "11111111-1111-4111-8111-111111111111",
+            [(r"C:\MyStuff\skills\cursor-rules", "dir"), (r"C:\Elsewhere\cursor-rules", "dir")],
+        ),
+    )
+
+    with pytest.raises(DuplicateMasterError, match="cursor-rules"):
+        load_config(layout.config_path)
+
+
+def test_load_config_rejects_a_rule_with_no_masters(layout):
+    _write_config(layout.config_path, _rule_toml("11111111-1111-4111-8111-111111111111", []))
+
+    with pytest.raises(ConfigError):
         load_config(layout.config_path)
 
 
@@ -182,8 +241,7 @@ def test_save_config_round_trips_through_load_config(layout):
             SyncRule(
                 id="11111111-1111-4111-8111-111111111111",
                 name="cursor-rules skill",
-                master=r"C:\MyStuff\skills\cursor-rules",
-                master_type="dir",
+                masters=[Master(path=r"C:\MyStuff\skills\cursor-rules", type="dir")],
                 replicas=[r"C:\ProjectA\.claude\skills\cursor-rules"],
                 ignore=[],
             )
@@ -194,6 +252,45 @@ def test_save_config_round_trips_through_load_config(layout):
 
     assert layout.config_path.is_file()
     assert load_config(layout.config_path) == config
+
+
+def test_save_config_round_trips_a_rule_with_several_masters(layout):
+    config = Config(
+        version=1,
+        rules=[
+            _rule(
+                "11111111-1111-4111-8111-111111111111",
+                Master(path=r"C:\MyStuff\skills\wayfinder", type="dir"),
+                Master(path=r"C:\MyStuff\resume.docx", type="file"),
+            )
+        ],
+    )
+
+    save_config(layout.config_path, config, layout.backups_dir)
+
+    assert load_config(layout.config_path) == config
+
+
+@pytest.mark.parametrize(
+    ("rules", "error_cls"),
+    [
+        ([_rule("r1")], ConfigError),
+        ([_rule("r1", Master(r"C:\a", "dir"), Master(r"C:\a", "dir"))], DuplicateMasterPathError),
+        (
+            [
+                _rule("r1", Master(r"C:\a", "dir"), name="shared"),
+                _rule("r2", Master(r"C:\b", "dir"), name="shared"),
+            ],
+            DuplicateRuleNameError,
+        ),
+    ],
+    ids=["no-masters", "duplicate-master-path", "duplicate-rule-name"],
+)
+def test_save_config_rejects_an_invalid_config_without_writing(layout, rules, error_cls):
+    with pytest.raises(error_cls):
+        save_config(layout.config_path, Config(version=1, rules=rules), layout.backups_dir)
+
+    assert not layout.config_path.exists()
 
 
 def test_save_config_writes_a_backup(layout):
@@ -256,6 +353,18 @@ def test_config_store_load_raises_when_a_previously_loaded_file_has_disappeared(
         store.load()
 
 
+def test_config_store_load_still_raises_for_a_vanished_file_after_a_rejected_save(layout):
+    store = ConfigStore(layout.config_path, layout.backups_dir)
+    store.save(Config(version=1, rules=[]))
+    store.load()
+    layout.config_path.unlink()
+    with pytest.raises(ConfigError):
+        store.save(Config(version=1, rules=[SyncRule(id="r1", name="r1", masters=[])]))
+
+    with pytest.raises(ConfigError):
+        store.load()
+
+
 def test_config_store_save_raises_when_file_changed_externally_since_load(layout):
     store = ConfigStore(layout.config_path, layout.backups_dir)
     store.save(Config(version=1, rules=[]))
@@ -269,37 +378,18 @@ def test_config_store_save_raises_when_file_changed_externally_since_load(layout
     assert load_config(layout.config_path).version == 1
 
 
-def test_load_config_rejects_duplicate_master_differing_in_case_and_trailing_slash(layout):
-    _write_config(
-        layout.config_path,
-        _rule_toml(
-            "11111111-1111-4111-8111-111111111111",
-            r"C:\MyStuff\skills\cursor-rules",
-            [r"C:\ProjectA\.claude\skills\cursor-rules"],
-        ),
-        _rule_toml(
-            "22222222-2222-4222-8222-222222222222",
-            "c:\\mystuff\\SKILLS\\cursor-rules\\",
-            [r"C:\ProjectB\.claude\skills\cursor-rules"],
-        ),
-    )
-
-    with pytest.raises(DuplicateMasterError):
-        load_config(layout.config_path)
-
-
 @pytest.mark.parametrize(
     "body",
     [
         "version = 1\n[[rule\n",
         "[settings]\n",
-        CONFIG_HEADER + "[[rule]]\nid = 'x'\nname = 'x'\nmaster = 'C:\\A'\n"
-        "master_type = 'dir'\nreplicas = 'C:\\B'\n",
-        CONFIG_HEADER + "[[rule]]\nid = 'x'\nname = 'x'\nmaster = 'C:\\A'\n"
-        "master_type = 'folder'\n",
-        CONFIG_HEADER + "[[rule]]\nid = 'x'\nname = 'x'\nmaster_type = 'dir'\n",
+        CONFIG_HEADER + "[[rule]]\nid = 'x'\nname = 'x'\n"
+        "masters = [{ path = 'C:\\A', type = 'dir' }]\nreplicas = 'C:\\B'\n",
+        CONFIG_HEADER + "[[rule]]\nid = 'x'\nname = 'x'\n"
+        "masters = [{ path = 'C:\\A', type = 'folder' }]\n",
+        CONFIG_HEADER + "[[rule]]\nid = 'x'\nname = 'x'\n",
     ],
-    ids=["bad-toml", "no-version", "replicas-not-list", "bad-master-type", "no-master"],
+    ids=["bad-toml", "no-version", "replicas-not-list", "bad-master-type", "no-masters-key"],
 )
 def test_load_config_raises_config_error_for_malformed_hand_edits(layout, body):
     layout.config_path.write_text(body)
