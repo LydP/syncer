@@ -1,7 +1,7 @@
 import time
 
-from syncer.check import BaselineEntry, CheckResult, FileChange, ReplicaCheckResult, hash_file
-from syncer.config import SyncRule, normalize_replica_path
+from syncer.check import BaselineEntry, FileChange, hash_file
+from syncer.config import Master, SyncRule, normalize_replica_path
 from syncer.conflict import (
     MAX_DIFF_BYTES,
     apply_keep_replica,
@@ -9,18 +9,17 @@ from syncer.conflict import (
     bulk_candidates_by_category,
     conflict_queue,
 )
-from syncer.review import BULK_CATEGORIES, build_review_rule
+from syncer.review import BULK_CATEGORIES, ReviewLeaf, ReviewReplica
 from syncer.state import ReplicaState, State, load_state
 
 EMPTY_STATE = State(version=1, hash_algo="sha256", rules={})
 
 
-def _rule(master, replicas, master_type="dir"):
+def _rule(master, replicas):
     return SyncRule(
         id="r1",
         name="Rule 1",
-        master=str(master),
-        master_type=master_type,
+        masters=[Master(path=str(master), type="dir")],
         replicas=[str(r) for r in replicas],
     )
 
@@ -35,26 +34,28 @@ def _change(rel_path, category, master_present=True, replica_present=True, basel
     )
 
 
-def _replica_result(replica_path, categories):
-    return ReplicaCheckResult(
-        replica_path=replica_path,
-        replica_exists=True,
-        has_baseline=True,
-        files=[_change(rel_path, category) for rel_path, category in categories],
-    )
+def _review_replicas(*replicas):
+    """`*replicas` are `(replica_path, [(rel_path, category), ...])` pairs.
 
-
-def _review_rule(*replicas):
-    """`*replicas` are `(replica_path, [(rel_path, category), ...])` pairs."""
-    return build_review_rule(
-        CheckResult(
-            rule_id="r1",
-            rule_name="Rule 1",
-            master_type="dir",
-            master_missing=False,
-            replicas=[_replica_result(path, cats) for path, cats in replicas],
+    Builds `ReviewReplica`s directly rather than going through
+    `check.CheckResult`/`review.build_review_rule` — that conversion is
+    review.py's own territory (issue #24), not conflict.py's; these tests
+    only exercise conflict.py's queue/bulk-selection logic over an already
+    built tree.
+    """
+    return [
+        ReviewReplica(
+            replica_path=path,
+            replica_exists=True,
+            # Sorted like review.py's own tree-building, since conflict_queue's
+            # ordering guarantee rides on the tree already arriving this way.
+            children=[
+                ReviewLeaf(path, _change(rel_path, category))
+                for rel_path, category in sorted(categories)
+            ],
         )
-    )
+        for path, categories in replicas
+    ]
 
 
 def _heavily_rewritten_markdown(prefix):
@@ -71,9 +72,9 @@ def _heavily_rewritten_markdown(prefix):
 def test_diverged_diff_is_replica_vs_masters_current_content(master_and_replica):
     master, replica = master_and_replica
     (master / "a.txt").write_text("line1\nline2\n")
-    (replica / "a.txt").write_text("line1\nCHANGED\n")
+    (replica / "master" / "a.txt").write_text("line1\nCHANGED\n")
     rule = _rule(master, [replica])
-    change = _change("a.txt", "diverged")
+    change = _change("master/a.txt", "diverged")
 
     view = build_conflict_view(rule, str(replica), change)
 
@@ -87,10 +88,10 @@ def test_diverged_diff_is_replica_vs_masters_current_content(master_and_replica)
 def test_both_changed_falls_back_to_metadata_only_baseline_panels(master_and_replica):
     master, replica = master_and_replica
     (master / "a.txt").write_text("master content")
-    (replica / "a.txt").write_text("replica content")
+    (replica / "master" / "a.txt").write_text("replica content")
     rule = _rule(master, [replica])
     change = FileChange(
-        rel_path="a.txt",
+        rel_path="master/a.txt",
         category="both_changed",
         master_present=True,
         replica_present=True,
@@ -123,9 +124,9 @@ def test_both_changed_falls_back_to_metadata_only_baseline_panels(master_and_rep
 
 def test_both_changed_with_master_deleted_shows_master_absent(master_and_replica):
     master, replica = master_and_replica
-    (replica / "a.txt").write_text("replica content")
+    (replica / "master" / "a.txt").write_text("replica content")
     rule = _rule(master, [replica])
-    change = _change("a.txt", "both_changed", master_present=False)
+    change = _change("master/a.txt", "both_changed", master_present=False)
 
     view = build_conflict_view(rule, str(replica), change)
 
@@ -136,9 +137,9 @@ def test_both_changed_with_master_deleted_shows_master_absent(master_and_replica
 def test_no_baseline_diffs_master_directly_against_replica_with_callout(master_and_replica):
     master, replica = master_and_replica
     (master / "a.txt").write_text("master line\n")
-    (replica / "a.txt").write_text("replica line\n")
+    (replica / "master" / "a.txt").write_text("replica line\n")
     rule = _rule(master, [replica])
-    change = _change("a.txt", "no_baseline", baseline_present=False)
+    change = _change("master/a.txt", "no_baseline", baseline_present=False)
 
     view = build_conflict_view(rule, str(replica), change)
 
@@ -155,9 +156,9 @@ def test_no_baseline_diffs_master_directly_against_replica_with_callout(master_a
 def test_diverged_with_binary_replica_falls_back_to_metadata_only(master_and_replica):
     master, replica = master_and_replica
     (master / "a.bin").write_bytes(b"binary master content")
-    (replica / "a.bin").write_bytes(b"\x00\x01\x02binary replica\xffcontent")
+    (replica / "master" / "a.bin").write_bytes(b"\x00\x01\x02binary replica\xffcontent")
     rule = _rule(master, [replica])
-    change = _change("a.bin", "diverged")
+    change = _change("master/a.bin", "diverged")
 
     view = build_conflict_view(rule, str(replica), change)
 
@@ -171,9 +172,9 @@ def test_diverged_with_binary_replica_falls_back_to_metadata_only(master_and_rep
 def test_no_baseline_with_oversized_text_falls_back_to_metadata_only(master_and_replica, monkeypatch):
     master, replica = master_and_replica
     (master / "a.txt").write_text("x" * 100)
-    (replica / "a.txt").write_text("y" * 100)
+    (replica / "master" / "a.txt").write_text("y" * 100)
     rule = _rule(master, [replica])
-    change = _change("a.txt", "no_baseline", baseline_present=False)
+    change = _change("master/a.txt", "no_baseline", baseline_present=False)
 
     import syncer.conflict as conflict_mod
 
@@ -196,9 +197,9 @@ def test_heavily_rewritten_markdown_content_diff_stays_within_a_tight_time_budge
     # exercises _diff_ops rather than the metadata-only fallback.
     assert 90_000 < len(master_text.encode("utf-8")) < MAX_DIFF_BYTES
     (master / "a.md").write_text(master_text)
-    (replica / "a.md").write_text(replica_text)
+    (replica / "master" / "a.md").write_text(replica_text)
     rule = _rule(master, [replica])
-    change = _change("a.md", "diverged")
+    change = _change("master/a.md", "diverged")
 
     start = time.perf_counter()
     view = build_conflict_view(rule, str(replica), change)
@@ -220,9 +221,9 @@ def test_single_line_edit_in_repetitive_file_diffs_as_one_changed_line(master_an
     lines = [f"v{i % 20}" for i in range(1000)]
     (master / "a.csv").write_text("\n".join(lines) + "\n")
     lines[500] = "edited"
-    (replica / "a.csv").write_text("\n".join(lines) + "\n")
+    (replica / "master" / "a.csv").write_text("\n".join(lines) + "\n")
     rule = _rule(master, [replica])
-    change = _change("a.csv", "no_baseline", baseline_present=False)
+    change = _change("master/a.csv", "no_baseline", baseline_present=False)
 
     view = build_conflict_view(rule, str(replica), change)
 
@@ -235,29 +236,29 @@ def test_single_line_edit_in_repetitive_file_diffs_as_one_changed_line(master_an
 
 
 def test_conflict_queue_holds_only_conflict_leaves_in_rel_path_order():
-    rule = _review_rule(
+    replicas = _review_replicas(
         ("rep1", [("z.txt", "diverged"), ("a.txt", "both_changed"), ("m.txt", "changed")])
     )
 
-    queue = conflict_queue(rule.replicas)
+    queue = conflict_queue(replicas)
 
     assert [leaf.rel_path for leaf in queue] == ["a.txt", "z.txt"]
 
 
 def test_conflict_queue_spans_every_replica_passed_in():
-    rule = _review_rule(("rep1", [("a.txt", "diverged")]), ("rep2", [("b.txt", "no_baseline")]))
+    replicas = _review_replicas(("rep1", [("a.txt", "diverged")]), ("rep2", [("b.txt", "no_baseline")]))
 
-    queue = conflict_queue(rule.replicas)
+    queue = conflict_queue(replicas)
 
     assert [leaf.rel_path for leaf in queue] == ["a.txt", "b.txt"]
 
 
 def test_bulk_candidates_narrows_to_the_requested_category():
-    rule = _review_rule(
+    replicas = _review_replicas(
         ("rep1", [("a.txt", "diverged"), ("b.txt", "diverged"), ("c.txt", "both_changed")])
     )
 
-    by_category = bulk_candidates_by_category(rule.replicas)
+    by_category = bulk_candidates_by_category(replicas)
 
     assert sorted(c.rel_path for c in by_category["diverged"]) == ["a.txt", "b.txt"]
     assert [c.rel_path for c in by_category["both_changed"]] == ["c.txt"]
@@ -275,23 +276,23 @@ def test_keep_replica_version_sets_kept_flag_and_baseline_to_replicas_content(
 ):
     master, replica = master_and_replica
     (master / "a.txt").write_text("master content")
-    (replica / "a.txt").write_text("replica content")
+    (replica / "master" / "a.txt").write_text("replica content")
     rule = _rule(master, [replica])
-    change = _change("a.txt", "diverged")
+    change = _change("master/a.txt", "diverged")
 
     new_state = apply_keep_replica(rule, str(replica), [change], EMPTY_STATE, layout.state_path)
 
-    entry = new_state.rules["r1"][normalize_replica_path(str(replica))].files["a.txt"]
+    entry = new_state.rules["r1"][normalize_replica_path(str(replica))].files["master/a.txt"]
     assert entry.kept is True
-    assert entry.hash == hash_file(str(replica / "a.txt"))
+    assert entry.hash == hash_file(str(replica / "master" / "a.txt"))
 
     reloaded = load_state(layout.state_path).state
-    assert reloaded.rules["r1"][normalize_replica_path(str(replica))].files["a.txt"].kept is True
+    assert reloaded.rules["r1"][normalize_replica_path(str(replica))].files["master/a.txt"].kept is True
 
 
 def test_keep_replica_version_leaves_other_files_and_replicas_untouched(master_and_replica, layout):
     master, replica = master_and_replica
-    (replica / "a.txt").write_text("replica content")
+    (replica / "master" / "a.txt").write_text("replica content")
     rule = _rule(master, [replica])
     replica_key = normalize_replica_path(str(replica))
     other_replica_key = normalize_replica_path(str(master.parent / "other"))
@@ -310,7 +311,7 @@ def test_keep_replica_version_leaves_other_files_and_replicas_untouched(master_a
             }
         },
     )
-    change = _change("a.txt", "diverged")
+    change = _change("master/a.txt", "diverged")
 
     new_state = apply_keep_replica(rule, str(replica), [change], starting_state, layout.state_path)
 
@@ -321,13 +322,13 @@ def test_keep_replica_version_leaves_other_files_and_replicas_untouched(master_a
 def test_keep_replica_version_records_masters_hash_at_keep_time(master_and_replica, layout):
     master, replica = master_and_replica
     (master / "a.txt").write_text("master content")
-    (replica / "a.txt").write_text("replica content")
+    (replica / "master" / "a.txt").write_text("replica content")
     rule = _rule(master, [replica])
-    change = _change("a.txt", "diverged")
+    change = _change("master/a.txt", "diverged")
 
     new_state = apply_keep_replica(rule, str(replica), [change], EMPTY_STATE, layout.state_path)
 
-    entry = new_state.rules["r1"][normalize_replica_path(str(replica))].files["a.txt"]
+    entry = new_state.rules["r1"][normalize_replica_path(str(replica))].files["master/a.txt"]
     assert entry.kept_master_hash == hash_file(str(master / "a.txt"))
 
 
@@ -335,11 +336,11 @@ def test_keep_replica_version_with_master_absent_records_none_master_hash(
     master_and_replica, layout
 ):
     master, replica = master_and_replica
-    (replica / "a.txt").write_text("replica content")
+    (replica / "master" / "a.txt").write_text("replica content")
     rule = _rule(master, [replica])
-    change = _change("a.txt", "both_changed", master_present=False)
+    change = _change("master/a.txt", "both_changed", master_present=False)
 
     new_state = apply_keep_replica(rule, str(replica), [change], EMPTY_STATE, layout.state_path)
 
-    entry = new_state.rules["r1"][normalize_replica_path(str(replica))].files["a.txt"]
+    entry = new_state.rules["r1"][normalize_replica_path(str(replica))].files["master/a.txt"]
     assert entry.kept_master_hash is None

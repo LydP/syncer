@@ -16,7 +16,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from syncer.check import FileChange, baseline_from_disk, hash_file
-from syncer.config import SyncRule, abs_path, normalize_replica_path
+from syncer.config import (
+    SyncRule,
+    master_abs_path,
+    masters_by_basename_key,
+    normalize_replica_path,
+    replica_abs_path,
+)
 from syncer.review import BULK_CATEGORIES, ReviewLeaf, ReviewNode, ReviewReplica, iter_leaves
 from syncer.state import State, merge_replica_entries, save_state
 
@@ -209,11 +215,12 @@ def apply_keep_replica(
     """
     if not changes:
         return state
+    masters_by_key = masters_by_basename_key(rule.masters)
     updates = {}
     for change in changes:
-        master_abs = abs_path(rule.master, rule.master_type, change.rel_path)
+        master_abs = master_abs_path(masters_by_key, change.rel_path)
         updates[change.rel_path] = baseline_from_disk(
-            abs_path(replica_root, rule.master_type, change.rel_path),
+            replica_abs_path(replica_root, change.rel_path),
             kept=True,
             kept_master_hash=hash_file(master_abs) if os.path.isfile(master_abs) else None,
         )
@@ -229,8 +236,8 @@ def apply_keep_replica(
 
 
 def build_conflict_view(rule: SyncRule, replica_root: str, change: FileChange) -> ConflictView:
-    master_abs = abs_path(rule.master, rule.master_type, change.rel_path)
-    replica_abs = abs_path(replica_root, rule.master_type, change.rel_path)
+    master_abs = master_abs_path(masters_by_basename_key(rule.masters), change.rel_path)
+    replica_abs = replica_abs_path(replica_root, change.rel_path)
 
     if change.category == "both_changed":
         # Neither side can be diffed against the baseline: its content was

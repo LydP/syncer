@@ -6,7 +6,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from syncer.check import BaselineEntry, FileChange, baseline_from_disk
-from syncer.config import SyncRule, abs_path as _abs_path, normalize_replica_path
+from syncer.config import (
+    Master,
+    SyncRule,
+    master_abs_path,
+    masters_by_basename_key,
+    normalize_replica_path,
+    replica_abs_path,
+)
 from syncer.state import State, merge_replica_entries, save_state
 from syncer.storage import atomic_copy, make_writable, utc_file_stamp
 
@@ -27,9 +34,11 @@ class SyncResult:
     errors: list[FileError]
 
 
-def _copy_change(rule: SyncRule, replica_root: str, change: FileChange) -> BaselineEntry:
-    master_abs = _abs_path(rule.master, rule.master_type, change.rel_path)
-    replica_abs = _abs_path(replica_root, rule.master_type, change.rel_path)
+def _copy_change(
+    masters_by_key: dict[str, Master], replica_root: str, change: FileChange
+) -> BaselineEntry:
+    master_abs = master_abs_path(masters_by_key, change.rel_path)
+    replica_abs = replica_abs_path(replica_root, change.rel_path)
     if change.category == "new":
         os.makedirs(os.path.dirname(replica_abs), exist_ok=True)
         shutil.copy2(master_abs, replica_abs)
@@ -51,12 +60,14 @@ def _prune_empty_parents(replica_key: str, start_dir: str) -> None:
         current = parent
 
 
-def _delete_change(master_type: str, replica_root: str, replica_key: str, rel_path: str) -> None:
-    replica_abs = _abs_path(replica_root, master_type, rel_path)
+def _delete_change(replica_root: str, replica_key: str, rel_path: str) -> None:
+    # Replicas are always dir-shaped now (a namespaced landing tree, never a
+    # bare file), so pruning is unconditional; it's a no-op when rel_path's
+    # parent is the replica root itself (a file master's landing path).
+    replica_abs = replica_abs_path(replica_root, rel_path)
     make_writable(replica_abs)
     os.remove(replica_abs)
-    if master_type == "dir":
-        _prune_empty_parents(replica_key, os.path.dirname(replica_abs))
+    _prune_empty_parents(replica_key, os.path.dirname(replica_abs))
 
 
 def _log_line(action: str, outcome: str, rel_path: str, message: str | None = None) -> str:
@@ -74,6 +85,7 @@ def sync(
     cancel=None,
 ) -> SyncResult:
     started = time.monotonic()
+    masters_by_key = masters_by_basename_key(rule.masters)
     ordered = [
         (replica, key, applied_changes[key])
         for replica in rule.replicas
@@ -102,10 +114,12 @@ def sync(
             action = "delete" if change.is_deletion else "copy"
             try:
                 if change.is_deletion:
-                    _delete_change(rule.master_type, replica, replica_key, change.rel_path)
+                    _delete_change(replica, replica_key, change.rel_path)
                     removed_paths.append(change.rel_path)
                 else:
-                    baseline_updates[change.rel_path] = _copy_change(rule, replica, change)
+                    baseline_updates[change.rel_path] = _copy_change(
+                        masters_by_key, replica, change
+                    )
             except OSError as exc:
                 errors.append(FileError(change.rel_path, str(exc)))
                 log_lines.append(_log_line(action, "error", change.rel_path, str(exc)))

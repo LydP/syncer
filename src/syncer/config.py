@@ -59,16 +59,12 @@ def default_rule_name(master: str, master_type: str) -> str:
     return basename
 
 
-def abs_path(root: str, master_type: str, rel_path: str) -> str:
-    """The on-disk path of `rel_path` under a master or replica `root`.
-
-    A file-type master's one replica entry *is* the file — there's no root
-    folder to join a rel_path onto (mirrors check.py's _scan_side). Shared by
-    sync.py and conflict.py so this rule has a single owner.
+def replica_abs_path(replica_root: str, rel_path: str) -> str:
+    """The on-disk path of a replica-relative `rel_path` — replicas are
+    always a namespaced landing tree, so it's a plain join. Shared by sync.py
+    and conflict.py so this rule has a single owner.
     """
-    if master_type == "file":
-        return root
-    return os.path.join(root, *rel_path.split("/"))
+    return os.path.join(replica_root, *rel_path.split("/"))
 
 
 @dataclass(frozen=True)
@@ -108,10 +104,35 @@ def is_owned_landing_path(masters_by_key: dict[str, Master], rel_path: str) -> b
     check() reconciles away silently (issue #21) and reconcile_with_config
     purges from the baseline (issue #22).
     """
-    # normcase turns "/" into "\\" on Windows, so split on either.
-    head, sep, _ = os.path.normcase(rel_path).replace("\\", "/").partition("/")
-    master = masters_by_key.get(head)
-    return master is not None and (master.type == "dir" or not sep)
+    master, nested, _ = _split_landing_path(masters_by_key, rel_path)
+    return master is not None and (master.type == "dir" or not nested)
+
+
+def master_abs_path(masters_by_key: dict[str, Master], rel_path: str) -> str:
+    """The master-side file behind a namespaced replica-relative `rel_path` —
+    the inverse of the landing-path namespacing `is_owned_landing_path`
+    checks — for sync.py/conflict.py to resolve a FileChange back to
+    master-side bytes. A file master's landing path is its bare filename, so
+    it maps straight to the master itself.
+    """
+    master, nested, rest = _split_landing_path(masters_by_key, rel_path)
+    if master is not None:
+        if master.type == "dir" and nested:
+            return os.path.join(master.path, *rest.split("/"))
+        if master.type == "file" and not nested:
+            return master.path
+    raise ValueError(f"{rel_path!r} is not a file landing path of any configured master")
+
+
+def _split_landing_path(
+    masters_by_key: dict[str, Master], rel_path: str
+) -> tuple[Master | None, bool, str]:
+    """`rel_path` split at its first separator: the master its head names
+    (matched case-insensitively), whether anything follows the head, and
+    that remainder with its casing intact.
+    """
+    head, sep, rest = rel_path.replace("\\", "/").partition("/")
+    return masters_by_key.get(os.path.normcase(head)), bool(sep), rest
 
 
 def _rule_name_key(name: str) -> str:
