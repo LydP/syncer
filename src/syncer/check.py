@@ -10,6 +10,7 @@ from syncer.config import (
     SyncRule,
     is_owned_landing_path,
     master_basename,
+    master_basename_key,
     masters_by_basename_key,
     normalize_replica_path,
 )
@@ -115,6 +116,21 @@ class NamespaceCollision:
     # (CONTEXT.md's Avoid line for this term), independent of either type.
     landing_path: str
     rule_ids: list[str]
+
+
+def collisions_for_rule(
+    rule_id: str, collisions: list[NamespaceCollision] | None
+) -> dict[tuple[str, str], NamespaceCollision]:
+    """The collisions naming `rule_id`, keyed by `(replica_path,
+    master_basename_key)` — scoped per replica, since a rule with several
+    replicas may collide in only one. The one owner of that scoping, shared by
+    check() (which skips these namespaces) and review (which flags them).
+    """
+    return {
+        (collision.replica_path, master_basename_key(collision.landing_path)): collision
+        for collision in collisions or ()
+        if rule_id in collision.rule_ids
+    }
 
 
 @dataclass(frozen=True)
@@ -540,14 +556,8 @@ def check(
     # Basenames this rule must not report on in a given replica: a collision
     # with another rule sharing that replica (CONTEXT.md's Cross-rule
     # namespace collision) — state.json has no master dimension, so per-file
-    # rows here would be contradictory guesses (issue #21). Scoped per
-    # replica_path: a rule with several replicas may collide in only one.
-    blocked_by_replica: dict[str, set[str]] = {}
-    for collision in collisions or []:
-        if rule.id in collision.rule_ids:
-            blocked_by_replica.setdefault(collision.replica_path, set()).add(
-                os.path.normcase(collision.landing_path)
-            )
+    # rows here would be contradictory guesses (issue #21).
+    collided = collisions_for_rule(rule.id, collisions)
 
     plans = []
     for replica in rule.replicas:
@@ -555,11 +565,8 @@ def check(
         replica_baseline = baseline.get(replica_key, {})
         baseline_by_key = {os.path.normcase(p): p for p in replica_baseline}
         side = _scan_side(replica, "dir")
-        blocked = blocked_by_replica.get(replica_key)
         # A collided master is out of scope here as if it weren't in the rule.
-        in_scope = (
-            {k: m for k, m in masters_by_key.items() if k not in blocked} if blocked else masters_by_key
-        )
+        in_scope = {k: m for k, m in masters_by_key.items() if (replica_key, k) not in collided}
         # The replica is walked whole, but it may hold other rules' landing
         # paths or unrelated content: keep only listing errors at its root or
         # inside a landing path this rule owns here.

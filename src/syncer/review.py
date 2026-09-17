@@ -1,20 +1,36 @@
-"""Review tree model for the review-and-sync UI (issue #6).
+"""Review tree model for the review-and-sync UI (issue #6, reworked for
+multi-master rules by issue #24).
 
-Pure, Qt-free: turns a `check.CheckResult` into a `rule > replica > folder >
-file` tree, buckets each file into the three action categories from
-spec.md §7 (plus a non-actionable "context" bucket for in-sync/foreign/
-unreadable rows), and provides selection roll-up over that tree. The GUI
-layer wires `QTreeWidget`/`QListWidget` to this model; it owns no widgets.
+Pure, Qt-free: turns a `check.CheckResult` into a `rule > replica >
+master-subfolder > folder > file` tree, buckets each file into the three
+action categories from spec.md §7 (plus a non-actionable "context" bucket
+for in-sync/foreign/unreadable rows), and provides selection roll-up over
+that tree. The GUI layer wires `QTreeWidget`/`QListWidget` to this model; it
+owns no widgets.
 """
 
 from __future__ import annotations
 
 import os
 from collections.abc import Callable, Iterable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import NamedTuple
 
-from syncer.check import CheckResult, FileChange, ReplicaCheckResult
+from syncer.check import (
+    CheckResult,
+    FileChange,
+    MasterStatus,
+    NamespaceCollision,
+    ReplicaCheckResult,
+    collisions_for_rule,
+)
+from syncer.config import (
+    Master,
+    master_basename,
+    master_basename_key,
+    masters_by_basename_key,
+    split_landing_path,
+)
 
 # category -> action bucket, spec.md §5's taxonomy table / §7's three
 # categories. "context" rows are shown (greyed) but never checkable.
@@ -112,32 +128,103 @@ class ReviewFolder:
 
 
 @dataclass(frozen=True)
+class ReviewMaster:
+    """One rule master's namespace inside one replica (CONTEXT.md's
+    **Replica** entry: a dir master's `<basename>/` subfolder, or a file
+    master's bare filename) — the new tree level issue #24 adds between a
+    replica and its files, so per-master **Master missing** and cross-rule
+    **Cross-rule namespace collision** each block only this one namespace,
+    not the whole rule (CONTEXT.md, spec.md §8).
+
+    `children` is always populated with the real per-file tree (like any
+    other branch) even when `missing` is true — missing is a runtime,
+    unlockable fact, not a structural one, so baking emptiness into the tree
+    would make it stick past an unlock. `collision` has no unlock, so a
+    collided master is instead built with no children at all (see
+    `_build_master`); nothing to bake around.
+    """
+
+    master: Master
+    missing: bool
+    collision: NamespaceCollision | None = None
+    children: list[ReviewNode] = field(default_factory=list)
+
+    @property
+    def landing_path(self) -> str:
+        return master_basename(self.master.path)
+
+    @property
+    def unlockable(self) -> bool:
+        """Offers the in-session "I know the master is missing" unlock —
+        only for a missing master; a collision never has one (CONTEXT.md)."""
+        return self.missing and self.collision is None
+
+
+@dataclass(frozen=True)
 class ReviewReplica:
     replica_path: str
     replica_exists: bool
-    children: list[ReviewNode] = field(default_factory=list)
+    children: list[ReviewMaster] = field(default_factory=list)
 
 
 ReviewNode = ReviewFolder | ReviewLeaf
-# Anything with `children` — the tree functions below accept a replica too.
-ReviewBranch = ReviewReplica | ReviewFolder
+# Anything with `children` — the tree functions below accept a replica or a
+# master-subfolder too.
+ReviewBranch = ReviewReplica | ReviewMaster | ReviewFolder
 
 
 @dataclass(frozen=True)
 class ReviewRule:
     rule_id: str
     rule_name: str
-    master_missing: bool
     replicas: list[ReviewReplica] = field(default_factory=list)
 
 
-def _build_replica(replica_result: ReplicaCheckResult) -> ReviewReplica:
+def is_master_blocked(master: ReviewMaster, unlocked: frozenset[str]) -> bool:
+    """Ordinary sync/selection is blocked for this master-subfolder: either a
+    cross-rule collision (never unlockable — CONTEXT.md) or a missing master
+    the user hasn't unlocked this session (spec.md §8, `unlocked` keyed by
+    `landing_path` since master basenames are unique within a rule).
+    """
+    return master.collision is not None or (master.missing and master.landing_path not in unlocked)
+
+
+def visible_replica(replica: ReviewReplica, unlocked: frozenset[str]) -> ReviewReplica:
+    """`replica` with every blocked master-subfolder's children cleared — the
+    one place blocking is resolved into an ordinary tree, so every other tree
+    function (tally, iter_leaves, node_state, toggle, ...) stays
+    blocking-unaware and unchanged from before issue #24's per-master split.
+    """
+    return replace(
+        replica,
+        children=[
+            replace(master, children=[]) if is_master_blocked(master, unlocked) else master
+            for master in replica.children
+        ],
+    )
+
+
+def _build_master(
+    status: MasterStatus,
+    collision: NamespaceCollision | None,
+    files: list[tuple[FileChange, str]],
+    replica_path: str,
+) -> ReviewMaster:
+    """`files` are `(change, rest)` pairs, `rest` being the rel_path below the
+    landing path (`split_landing_path`'s remainder) — empty for a file
+    master's one file, which lands directly under the master node."""
     root: list[ReviewNode] = []
     folders: dict[str, ReviewFolder] = {}
-    for change in sorted(replica_result.files, key=lambda c: c.rel_path):
+    if collision is not None:
+        # A collided master is never walked into (CONTEXT.md: "no unlock...
+        # the tool never offers to proceed anyway") — unlike `missing`,
+        # there's no session state that could later reveal these files, so
+        # they're simply never built rather than built-then-hidden.
+        files = []
+    for change, rest in sorted(files, key=lambda pair: pair[0].rel_path):
         siblings = root
         acc = ""
-        for segment in change.rel_path.split("/")[:-1]:
+        for segment in rest.split("/")[:-1]:
             # Case-insensitive like check()'s own matching: rel_paths arrive in
             # master/baseline/replica casing, which can differ for one folder.
             acc = os.path.normcase(f"{acc}/{segment}" if acc else segment)
@@ -146,16 +233,62 @@ def _build_replica(replica_result: ReplicaCheckResult) -> ReviewReplica:
                 folder = folders[acc] = ReviewFolder(name=segment)
                 siblings.append(folder)
             siblings = folder.children
-        siblings.append(ReviewLeaf(replica_result.replica_path, change))
-    return ReviewReplica(
-        replica_path=replica_result.replica_path,
-        replica_exists=replica_result.replica_exists,
+        siblings.append(ReviewLeaf(replica_path, change))
+    return ReviewMaster(
+        master=status.master,
+        missing=status.missing,
+        collision=collision,
         children=root,
     )
 
 
-def iter_leaves(nodes: Iterable[ReviewNode | ReviewReplica]) -> Iterator[ReviewLeaf]:
-    """Every leaf under `nodes`, recursing into folders/replicas."""
+def _group_by_master(
+    files: list[FileChange], masters_by_key: dict[str, Master]
+) -> dict[str, list[tuple[FileChange, str]]]:
+    """`files` bucketed by the basename key of the master whose landing path
+    starts each `rel_path` — always exactly one, since check() only ever
+    reports rel_paths owned by a configured, non-collided master of this rule
+    (config.is_owned_landing_path) — each paired with its remainder below
+    that landing path. Reuses config.split_landing_path so the head-matching
+    stays identical to is_owned_landing_path/master_abs_path's.
+    """
+    grouped: dict[str, list[tuple[FileChange, str]]] = {key: [] for key in masters_by_key}
+    for change in files:
+        master, _, rest = split_landing_path(masters_by_key, change.rel_path)
+        if master is not None:
+            grouped[master_basename_key(master.path)].append((change, rest))
+    return grouped
+
+
+def _build_replica(
+    replica_result: ReplicaCheckResult,
+    masters: list[MasterStatus],
+    masters_by_key: dict[str, Master],
+    collided: dict[tuple[str, str], NamespaceCollision],
+) -> ReviewReplica:
+    grouped = _group_by_master(replica_result.files, masters_by_key)
+    master_nodes = []
+    for status in masters:
+        key = master_basename_key(status.master.path)
+        master_nodes.append(
+            _build_master(
+                status,
+                collided.get((replica_result.replica_path, key)),
+                grouped[key],
+                replica_result.replica_path,
+            )
+        )
+    return ReviewReplica(
+        replica_path=replica_result.replica_path,
+        replica_exists=replica_result.replica_exists,
+        children=master_nodes,
+    )
+
+
+def iter_leaves(nodes: Iterable[ReviewNode | ReviewBranch]) -> Iterator[ReviewLeaf]:
+    """Every leaf under `nodes`, recursing into folders/master-subfolders/
+    replicas alike — blocking-unaware; pass `visible_replica(...)`'d replicas
+    to exclude a blocked master-subfolder's leaves (issue #24)."""
     for node in nodes:
         if isinstance(node, ReviewLeaf):
             yield node
@@ -163,7 +296,7 @@ def iter_leaves(nodes: Iterable[ReviewNode | ReviewReplica]) -> Iterator[ReviewL
             yield from iter_leaves(node.children)
 
 
-def tally(nodes: Iterable[ReviewNode | ReviewReplica]) -> dict[str, int]:
+def tally(nodes: Iterable[ReviewNode | ReviewBranch]) -> dict[str, int]:
     """Rolled-up leaf counts by bucket ("safe"/"delete"/"conflict"/"context")
     across `nodes`, recursing into folders."""
     counts = dict.fromkeys(BUCKETS, 0)
@@ -178,11 +311,11 @@ def has_drift(node: ReviewBranch) -> bool:
     return any(leaf.bucket != "context" for leaf in iter_leaves([node]))
 
 
-def _checkable_keys(node: ReviewNode | ReviewReplica) -> frozenset[LeafKey]:
+def _checkable_keys(node: ReviewNode | ReviewBranch) -> frozenset[LeafKey]:
     return frozenset(leaf.key for leaf in iter_leaves([node]) if leaf.checkable)
 
 
-def node_state(node: ReviewNode | ReviewReplica, selected: frozenset[LeafKey]) -> str:
+def node_state(node: ReviewNode | ReviewBranch, selected: frozenset[LeafKey]) -> str:
     """"checked" / "unchecked" / "partial", computed bottom-up from `selected`
     — never stored on the node itself. A leaf that isn't checkable (context,
     conflict) is always "unchecked" and never contributes to a folder's
@@ -195,7 +328,7 @@ def node_state(node: ReviewNode | ReviewReplica, selected: frozenset[LeafKey]) -
 
 
 def toggle(
-    node: ReviewNode | ReviewReplica, selected: frozenset[LeafKey]
+    node: ReviewNode | ReviewBranch, selected: frozenset[LeafKey]
 ) -> frozenset[LeafKey]:
     """One click = full tick + roll-down (spec.md §7): a "checked" node clears
     every checkable descendant; anything else ("unchecked" or the computed
@@ -209,62 +342,88 @@ def toggle(
 
 
 def _grouped_changes(
-    rule: ReviewRule, include: Callable[[ReviewLeaf], bool]
+    rule: ReviewRule, include: Callable[[ReviewLeaf], bool], unlocked: frozenset[str]
 ) -> dict[str, list[FileChange]]:
     """`{replica_path: [FileChange]}` (the shape `sync()` consumes, spec.md
-    §11) for every leaf where `include(leaf)` is true."""
+    §11) for every leaf where `include(leaf)` is true, across every replica's
+    *unblocked* master-subfolders only (issue #24: a blocked namespace never
+    contributes, bulk actions included)."""
     applied: dict[str, list[FileChange]] = {}
     for replica in rule.replicas:
-        changes = [leaf.file_change for leaf in iter_leaves([replica]) if include(leaf)]
+        visible = visible_replica(replica, unlocked)
+        changes = [leaf.file_change for leaf in iter_leaves([visible]) if include(leaf)]
         if changes:
             applied[replica.replica_path] = changes
     return applied
 
 
 def resolve_selection(
-    rule: ReviewRule, selected: frozenset[LeafKey]
+    rule: ReviewRule, selected: frozenset[LeafKey], unlocked: frozenset[str] = frozenset()
 ) -> dict[str, list[FileChange]]:
     """Ticked leaf keys -> the `{replica_path: [FileChange]}` shape
     `sync()` consumes. Only checkable leaves in `selected` are included, so a
-    stale key whose file has since become a conflict never appears here.
+    stale key whose file has since become a conflict — or whose
+    master-subfolder has since become blocked — never appears here.
     """
-    return _grouped_changes(rule, lambda leaf: leaf.checkable and leaf.key in selected)
+    return _grouped_changes(
+        rule, lambda leaf: leaf.checkable and leaf.key in selected, unlocked
+    )
 
 
 def selection_by_bucket(
-    rule: ReviewRule, selected: frozenset[LeafKey], bucket: str
+    rule: ReviewRule, selected: frozenset[LeafKey], bucket: str, unlocked: frozenset[str] = frozenset()
 ) -> dict[str, list[FileChange]]:
     """The ticked selection narrowed to one bucket — e.g. the master-deleted
     files a "Review deletes" batch-confirm dialog itemises separately from
     an ordinary safe-drift sync (spec.md §8)."""
-    return _grouped_changes(rule, lambda leaf: leaf.bucket == bucket and leaf.key in selected)
+    return _grouped_changes(
+        rule, lambda leaf: leaf.bucket == bucket and leaf.key in selected, unlocked
+    )
 
 
-def sync_all_safe_changes(rule: ReviewRule) -> dict[str, list[FileChange]]:
+def sync_all_safe_changes(
+    rule: ReviewRule, unlocked: frozenset[str] = frozenset()
+) -> dict[str, list[FileChange]]:
     """"Sync all safe changes" (spec.md §7): ignores the current tick
     selection entirely and applies every `new` + `changed` file across the
-    rule's replicas."""
-    return _grouped_changes(rule, lambda leaf: leaf.bucket == "safe")
+    rule's unblocked master-subfolders."""
+    return _grouped_changes(rule, lambda leaf: leaf.bucket == "safe", unlocked)
 
 
-def is_sync_blocked(rule: ReviewRule, unlocked: bool) -> bool:
-    """Master missing blocks ordinary tick-and-sync for the rule until the
-    user's in-session, non-persisted "I know the master is missing" unlock
-    (spec.md §8) — re-blocks on the next check/relaunch since `unlocked` is
-    never stored on the model itself."""
-    return rule.master_missing and not unlocked
+def rule_tally(rule: ReviewRule, unlocked: frozenset[str] = frozenset()) -> dict[str, int]:
+    """Bucket counts aggregated across every replica's unblocked
+    master-subfolders in the rule — the left pane's one-line status ("N to
+    sync, M to delete, K conflict"); a blocked namespace contributes nothing
+    (issue #24)."""
+    return tally([visible_replica(r, unlocked) for r in rule.replicas])
 
 
-def rule_tally(rule: ReviewRule) -> dict[str, int]:
-    """Bucket counts aggregated across every replica in the rule — the left
-    pane's one-line status ("N to sync, M to delete, K conflict")."""
-    return tally(rule.replicas)
+def blocked_master_count(rule: ReviewRule, unlocked: frozenset[str] = frozenset()) -> int:
+    """Count of (replica, master-subfolder) pairs currently blocked —
+    collision blocking is scoped per replica, so this can exceed the rule's
+    own master count when more than one replica is affected."""
+    return sum(
+        is_master_blocked(master, unlocked)
+        for replica in rule.replicas
+        for master in replica.children
+    )
 
 
-def build_review_rule(check_result: CheckResult) -> ReviewRule:
+def build_review_rule(
+    check_result: CheckResult, collisions: list[NamespaceCollision] | None = None
+) -> ReviewRule:
+    """`collisions` should be `find_namespace_collisions()`'s full result (or
+    any subset) — narrowed here to the ones naming this rule and matched to
+    each replica by path, so a caller can just pass the whole-config list
+    through for every rule it builds.
+    """
+    collided = collisions_for_rule(check_result.rule_id, collisions)
+    masters_by_key = masters_by_basename_key([status.master for status in check_result.masters])
     return ReviewRule(
         rule_id=check_result.rule_id,
         rule_name=check_result.rule_name,
-        master_missing=check_result.master_missing,
-        replicas=[_build_replica(r) for r in check_result.replicas],
+        replicas=[
+            _build_replica(r, check_result.masters, masters_by_key, collided)
+            for r in check_result.replicas
+        ],
     )

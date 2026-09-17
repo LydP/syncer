@@ -104,7 +104,7 @@ def is_owned_landing_path(masters_by_key: dict[str, Master], rel_path: str) -> b
     check() reconciles away silently (issue #21) and reconcile_with_config
     purges from the baseline (issue #22).
     """
-    master, nested, _ = _split_landing_path(masters_by_key, rel_path)
+    master, nested, _ = split_landing_path(masters_by_key, rel_path)
     return master is not None and (master.type == "dir" or not nested)
 
 
@@ -115,7 +115,7 @@ def master_abs_path(masters_by_key: dict[str, Master], rel_path: str) -> str:
     master-side bytes. A file master's landing path is its bare filename, so
     it maps straight to the master itself.
     """
-    master, nested, rest = _split_landing_path(masters_by_key, rel_path)
+    master, nested, rest = split_landing_path(masters_by_key, rel_path)
     if master is not None:
         if master.type == "dir" and nested:
             return os.path.join(master.path, *rest.split("/"))
@@ -124,7 +124,7 @@ def master_abs_path(masters_by_key: dict[str, Master], rel_path: str) -> str:
     raise ValueError(f"{rel_path!r} is not a file landing path of any configured master")
 
 
-def _split_landing_path(
+def split_landing_path(
     masters_by_key: dict[str, Master], rel_path: str
 ) -> tuple[Master | None, bool, str]:
     """`rel_path` split at its first separator: the master its head names
