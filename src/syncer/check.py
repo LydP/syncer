@@ -133,6 +133,23 @@ def collisions_for_rule(
     }
 
 
+def other_rule_names(
+    collision: NamespaceCollision, rule_id: str, rules_by_id: dict[str, SyncRule]
+) -> list[str]:
+    """The display names of the *other* rules party to `collision`, for the
+    "also claimed by ..." wording. Pure and unit-tested so the rule modal's
+    preview and the review tree's banner name the same rules — the GUI layer
+    only formats the sentence around this list (CLAUDE.md's pure core / thin
+    Qt adapter split). Ids with no configured rule are dropped, so callers
+    must handle an empty list (the "another rule" fallback).
+    """
+    return [
+        rules_by_id[rid].name
+        for rid in collision.rule_ids
+        if rid != rule_id and rid in rules_by_id
+    ]
+
+
 @dataclass(frozen=True)
 class CheckResult:
     rule_id: str
@@ -404,8 +421,10 @@ def _scan_masters(masters: list[Master]) -> tuple[_Side, list[MasterStatus]]:
             # The master's own root ("") is already reported as its MasterStatus.
             if key:
                 unlisted_dirs[prefix_key + key] = message
-    exists = not all(status.missing for status in statuses)
-    return _Side(entries, exists, walk_errors, unlisted_dirs), statuses
+    # `exists` is meaningless for this combined side — several masters, each
+    # present or not on its own. Per-master presence is `statuses`' job, which
+    # is what every caller reads; nothing consults the side's own flag.
+    return _Side(entries, True, walk_errors, unlisted_dirs), statuses
 
 
 @dataclass(frozen=True)

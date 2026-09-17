@@ -15,10 +15,14 @@ from syncer.config import (
     Master,
     SyncRule,
     default_rule_name,
+    find_master_conflict,
     find_name_conflict,
+    find_replica_sharers,
     load_config,
     normalize_replica_path,
     save_config,
+    with_rule,
+    without_rule,
 )
 
 CONFIG_HEADER = "version = 1\n\n[settings]\n\n"
@@ -50,8 +54,8 @@ def test_default_rule_name_keeps_full_basename_for_a_dir_master():
     assert default_rule_name(r"C:\Projects\my-skills", "dir") == "my-skills"
 
 
-def _rule(id, *masters, name=None):
-    return SyncRule(id=id, name=name or id, masters=list(masters), replicas=[])
+def _rule(id, *masters, name=None, replicas=()):
+    return SyncRule(id=id, name=name or id, masters=list(masters), replicas=list(replicas))
 
 
 def test_find_name_conflict_returns_none_when_no_other_rule_uses_the_name():
@@ -71,6 +75,102 @@ def test_find_name_conflict_excludes_the_given_rule_id():
     config = Config(version=1, rules=[_rule("r1", Master(r"C:\a", "dir"), name="shared-name")])
 
     assert find_name_conflict(config, "shared-name", exclude_rule_id="r1") is None
+
+
+def test_find_master_conflict_returns_none_when_masters_share_neither_path_nor_basename():
+    masters = [Master(r"C:\a\cursor-rules", "dir"), Master(r"C:\b\other-skill", "dir")]
+
+    assert find_master_conflict(masters, 0) is None
+
+
+def test_find_master_conflict_reports_a_shared_path():
+    other = Master(r"C:\a", "dir")
+    masters = [Master("c:\\A\\", "dir"), other]
+
+    assert find_master_conflict(masters, 0) == ("path", other)
+
+
+def test_find_master_conflict_reports_a_shared_basename():
+    other = Master(r"C:\Elsewhere\cursor-rules", "dir")
+    masters = [Master(r"C:\MyStuff\skills\cursor-rules", "dir"), other]
+
+    assert find_master_conflict(masters, 0) == ("basename", other)
+
+
+def test_find_master_conflict_prefers_a_shared_path_over_a_shared_basename():
+    # An exact path duplicate outranks the basename it necessarily also
+    # shares; reporting both would double-flag the same pair of rows.
+    same_path = Master("c:\\a\\skills\\", "dir")
+    masters = [
+        Master(r"C:\a\skills", "dir"),
+        Master(r"C:\elsewhere\skills", "dir"),  # basename-only match, earlier in the list
+        same_path,
+    ]
+
+    assert find_master_conflict(masters, 0) == ("path", same_path)
+
+
+def test_with_rule_appends_a_rule_whose_id_is_not_configured_yet():
+    config = Config(version=1, rules=[_rule("r1", Master(r"C:\a", "dir"))])
+    added = _rule("r2", Master(r"C:\b", "dir"))
+
+    assert with_rule(config, added).rules == [config.rules[0], added]
+
+
+def test_with_rule_replaces_in_place_the_rule_sharing_its_id():
+    first = _rule("r1", Master(r"C:\a", "dir"))
+    second = _rule("r2", Master(r"C:\b", "dir"))
+    config = Config(version=1, rules=[first, second])
+    edited = _rule("r1", Master(r"C:\a", "dir"), name="renamed")
+
+    # Replaced where it sat, so an edit never reorders the rule list.
+    assert with_rule(config, edited).rules == [edited, second]
+
+
+def test_with_rule_preserves_other_config_fields():
+    config = Config(version=7, rules=[])
+
+    assert with_rule(config, _rule("r1", Master(r"C:\a", "dir"))).version == 7
+
+
+def test_without_rule_drops_only_the_named_rule():
+    first = _rule("r1", Master(r"C:\a", "dir"))
+    second = _rule("r2", Master(r"C:\b", "dir"))
+    config = Config(version=1, rules=[first, second])
+
+    assert without_rule(config, "r1").rules == [second]
+
+
+def test_without_rule_is_a_no_op_for_an_unconfigured_id():
+    config = Config(version=1, rules=[_rule("r1", Master(r"C:\a", "dir"))])
+
+    assert without_rule(config, "nope").rules == config.rules
+
+
+def test_find_replica_sharers_returns_empty_when_no_other_rule_uses_the_replica():
+    config = Config(version=1, rules=[_rule("r1", Master(r"C:\a", "dir"), name="alpha")])
+
+    assert find_replica_sharers(config, r"C:\ProjectA\skills\a") == []
+
+
+def test_find_replica_sharers_returns_the_other_rules_using_the_replica():
+    sharer = _rule(
+        "r1", Master(r"C:\a", "dir"), name="alpha", replicas=[r"C:\ProjectA\skills\a"]
+    )
+    config = Config(version=1, rules=[sharer])
+
+    assert find_replica_sharers(config, "c:\\projecta\\skills\\a\\") == [sharer]
+
+
+def test_find_replica_sharers_excludes_the_given_rule_id():
+    config = Config(
+        version=1,
+        rules=[
+            _rule("r1", Master(r"C:\a", "dir"), name="alpha", replicas=[r"C:\ProjectA\skills\a"])
+        ],
+    )
+
+    assert find_replica_sharers(config, r"C:\ProjectA\skills\a", exclude_rule_id="r1") == []
 
 
 def test_normalize_replica_path_resolves_relative_segments_and_case():

@@ -3,7 +3,14 @@ import os
 import pytest
 
 import syncer.check as check_module
-from syncer.check import BaselineEntry, baseline_from_disk, check, find_namespace_collisions, hash_file
+from syncer.check import (
+    BaselineEntry,
+    baseline_from_disk,
+    check,
+    find_namespace_collisions,
+    hash_file,
+    other_rule_names,
+)
 from syncer.config import Master, SyncRule, normalize_replica_path
 
 # Any digest that can't match real content, for exercising a stale baseline.
@@ -863,6 +870,27 @@ def test_find_namespace_collisions_detects_two_rules_landing_at_the_same_spot(tm
     assert collision.landing_path == "skills"
     assert collision.replica_path == normalize_replica_path(str(replica))
     assert set(collision.rule_ids) == {"a", "b"}
+
+
+def test_other_rule_names_lists_the_collisions_other_rules_by_display_name(tmp_path):
+    replica = tmp_path / "replica"
+    rule_a = _rule(tmp_path / "a" / "skills", [replica], rule_id="a")
+    rule_b = _rule(tmp_path / "b" / "skills", [replica], rule_id="b")
+    [collision] = find_namespace_collisions([rule_a, rule_b])
+    rules_by_id = {"a": rule_a, "b": rule_b}
+
+    assert other_rule_names(collision, "a", rules_by_id) == [rule_b.name]
+    assert other_rule_names(collision, "b", rules_by_id) == [rule_a.name]
+
+
+def test_other_rule_names_drops_ids_with_no_configured_rule(tmp_path):
+    # The GUI falls back to "another rule" on the empty list this returns.
+    replica = tmp_path / "replica"
+    rule_a = _rule(tmp_path / "a" / "skills", [replica], rule_id="a")
+    rule_b = _rule(tmp_path / "b" / "skills", [replica], rule_id="b")
+    [collision] = find_namespace_collisions([rule_a, rule_b])
+
+    assert other_rule_names(collision, "a", {"a": rule_a}) == []
 
 
 def test_find_namespace_collisions_ignores_rules_with_no_shared_landing_spot(tmp_path):

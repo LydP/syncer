@@ -44,6 +44,7 @@ from syncer.check import (
     check,
     collisions_for_rule,
     find_namespace_collisions,
+    other_rule_names,
 )
 from syncer.config import SyncRule, master_basename
 from syncer.conflict import apply_keep_replica, bulk_candidates_by_category, conflict_queue
@@ -436,10 +437,6 @@ class ReviewPane(QWidget):
         for row, rule_id in enumerate(self._rules_by_id):
             self.rule_list.item(row).setText(self._rule_list_text(rule_id))
 
-    def _refresh_rule_row(self, rule_id: str) -> None:
-        row = list(self._rules_by_id).index(rule_id)  # also the row order
-        self.rule_list.item(row).setText(self._rule_list_text(rule_id))
-
     def _on_rule_row_changed(self, row: int) -> None:
         if row < 0:
             self._current_rule_id = None
@@ -466,11 +463,7 @@ class ReviewPane(QWidget):
         self._refresh_bar()
 
     def _collision_banner(self, rule_id: str, collision: NamespaceCollision) -> str:
-        others = [
-            self._rules_by_id[rid].name
-            for rid in collision.rule_ids
-            if rid != rule_id and rid in self._rules_by_id
-        ]
+        others = other_rule_names(collision, rule_id, self._rules_by_id)
         return (
             f"Also claimed by: {', '.join(others) or 'another rule'} — rename a master or "
             "stop sharing this replica to fix."
@@ -574,7 +567,7 @@ class ReviewPane(QWidget):
 
     def _unlock_master(self, rule_id: str, landing_path: str) -> None:
         self._unlocked[rule_id] |= {landing_path}
-        self._refresh_rule_row(rule_id)
+        self._refresh_rule_list()
         self._show_rule(rule_id)
 
     def _request_conflict_resolution(self) -> None:

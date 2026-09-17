@@ -250,13 +250,15 @@ def _group_by_master(
     reports rel_paths owned by a configured, non-collided master of this rule
     (config.is_owned_landing_path) — each paired with its remainder below
     that landing path. Reuses config.split_landing_path so the head-matching
-    stays identical to is_owned_landing_path/master_abs_path's.
+    stays identical to is_owned_landing_path/master_abs_path's — and its
+    `key`, rather than re-deriving the same string from `master.path` once
+    per change.
     """
     grouped: dict[str, list[tuple[FileChange, str]]] = {key: [] for key in masters_by_key}
     for change in files:
-        master, _, rest = split_landing_path(masters_by_key, change.rel_path)
-        if master is not None:
-            grouped[master_basename_key(master.path)].append((change, rest))
+        split = split_landing_path(masters_by_key, change.rel_path)
+        if split.master is not None:
+            grouped[split.key].append((change, split.rest))
     return grouped
 
 

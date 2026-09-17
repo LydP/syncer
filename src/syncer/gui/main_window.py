@@ -22,7 +22,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from syncer.config import Config, ConfigClobberError, ConfigStore, SyncRule
+from syncer.config import (
+    Config,
+    ConfigClobberError,
+    ConfigStore,
+    SyncRule,
+    with_rule,
+    without_rule,
+)
 from syncer.gui.review_pane import ReviewPane
 from syncer.gui.rule_dialog import RuleDialog
 from syncer.state import State, reconcile_and_save
@@ -142,9 +149,7 @@ class MainWindow(QMainWindow):
     def _add_rule(self) -> None:
         new_rule = self._run_rule_dialog(None)
         if new_rule is not None:
-            self._save_and_adopt(
-                Config(version=self._config.version, rules=[*self._config.rules, new_rule])
-            )
+            self._save_and_adopt(with_rule(self._config, new_rule))
 
     def _edit_selected_rule(self) -> None:
         rule = self._selected_rule()
@@ -152,12 +157,7 @@ class MainWindow(QMainWindow):
             return
         edited = self._run_rule_dialog(rule)
         if edited is not None:
-            self._save_and_adopt(
-                Config(
-                    version=self._config.version,
-                    rules=[edited if r.id == rule.id else r for r in self._config.rules],
-                )
-            )
+            self._save_and_adopt(with_rule(self._config, edited))
 
     def _delete_selected_rule(self) -> None:
         rule = self._selected_rule()
@@ -172,12 +172,7 @@ class MainWindow(QMainWindow):
             QMessageBox.No,
         )
         if confirm == QMessageBox.Yes:
-            self._save_and_adopt(
-                Config(
-                    version=self._config.version,
-                    rules=[r for r in self._config.rules if r.id != rule.id],
-                )
-            )
+            self._save_and_adopt(without_rule(self._config, rule.id))
 
     def _check_selected_rule(self) -> None:
         rule_id = self.review_pane.current_rule_id

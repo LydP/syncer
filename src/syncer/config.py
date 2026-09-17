@@ -3,8 +3,9 @@ import os
 import shutil
 import tomllib
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
+from typing import NamedTuple
 
 import tomli_w
 
@@ -104,8 +105,8 @@ def is_owned_landing_path(masters_by_key: dict[str, Master], rel_path: str) -> b
     check() reconciles away silently (issue #21) and reconcile_with_config
     purges from the baseline (issue #22).
     """
-    master, nested, _ = split_landing_path(masters_by_key, rel_path)
-    return master is not None and (master.type == "dir" or not nested)
+    split = split_landing_path(masters_by_key, rel_path)
+    return split.master is not None and (split.master.type == "dir" or not split.nested)
 
 
 def master_abs_path(masters_by_key: dict[str, Master], rel_path: str) -> str:
@@ -115,7 +116,7 @@ def master_abs_path(masters_by_key: dict[str, Master], rel_path: str) -> str:
     master-side bytes. A file master's landing path is its bare filename, so
     it maps straight to the master itself.
     """
-    master, nested, rest = split_landing_path(masters_by_key, rel_path)
+    master, nested, rest, _ = split_landing_path(masters_by_key, rel_path)
     if master is not None:
         if master.type == "dir" and nested:
             return os.path.join(master.path, *rest.split("/"))
@@ -124,15 +125,26 @@ def master_abs_path(masters_by_key: dict[str, Master], rel_path: str) -> str:
     raise ValueError(f"{rel_path!r} is not a file landing path of any configured master")
 
 
-def split_landing_path(
-    masters_by_key: dict[str, Master], rel_path: str
-) -> tuple[Master | None, bool, str]:
+class LandingSplit(NamedTuple):
+    """`split_landing_path`'s result. `key` is the normcased head — the same
+    basename key `masters_by_basename_key` is keyed on — exposed so a caller
+    grouping by master doesn't have to re-derive it from `master.path`.
+    """
+
+    master: Master | None
+    nested: bool
+    rest: str
+    key: str
+
+
+def split_landing_path(masters_by_key: dict[str, Master], rel_path: str) -> LandingSplit:
     """`rel_path` split at its first separator: the master its head names
-    (matched case-insensitively), whether anything follows the head, and
-    that remainder with its casing intact.
+    (matched case-insensitively), whether anything follows the head, that
+    remainder with its casing intact, and the normcased head itself.
     """
     head, sep, rest = rel_path.replace("\\", "/").partition("/")
-    return masters_by_key.get(os.path.normcase(head)), bool(sep), rest
+    key = os.path.normcase(head)
+    return LandingSplit(masters_by_key.get(key), bool(sep), rest, key)
 
 
 def _rule_name_key(name: str) -> str:
@@ -152,6 +164,67 @@ def find_name_conflict(
         if rule.id != exclude_rule_id and _rule_name_key(rule.name) == target:
             return rule
     return None
+
+
+def find_master_conflict(masters: list[Master], index: int) -> tuple[str, Master] | None:
+    """The other master (if any) `masters[index]` collides with, as
+    `("path" | "basename", other)` — the same two per-rule duplicate rules
+    `_validate_rules` raises on, in non-raising form for the add/edit-rule
+    modal's inline per-row validation.
+
+    Path wins over basename, matching `_validate_rules`' own ordering: equal
+    paths always share a basename, so reporting both would double-flag one
+    pair of rows. Hence the whole list is scanned before a basename match is
+    returned — a path duplicate anywhere outranks an earlier basename one.
+    """
+    candidate = masters[index]
+    target_path = normalize_replica_path(candidate.path)
+    target_basename = master_basename_key(candidate.path)
+    basename_match: Master | None = None
+    for other_index, other in enumerate(masters):
+        if other_index == index:
+            continue
+        if normalize_replica_path(other.path) == target_path:
+            return ("path", other)
+        if basename_match is None and master_basename_key(other.path) == target_basename:
+            basename_match = other
+    return ("basename", basename_match) if basename_match is not None else None
+
+
+def with_rule(config: Config, rule: SyncRule) -> Config:
+    """`config` with `rule` appended, or replacing the rule sharing its id.
+
+    The single definition of what saving an add/edit produces, so the
+    rule modal's live collision preview is computed against exactly the
+    config a save would write rather than its own private guess.
+    """
+    if any(existing.id == rule.id for existing in config.rules):
+        rules = [rule if existing.id == rule.id else existing for existing in config.rules]
+    else:
+        rules = [*config.rules, rule]
+    return replace(config, rules=rules)
+
+
+def without_rule(config: Config, rule_id: str) -> Config:
+    """`config` with the rule of `rule_id` removed — `with_rule`'s inverse."""
+    return replace(config, rules=[r for r in config.rules if r.id != rule_id])
+
+
+def find_replica_sharers(
+    config: Config, path: str, *, exclude_rule_id: str | None = None
+) -> list[SyncRule]:
+    """The other rules (if any) already listing `path` as a replica.
+
+    Informational only — ADR 0002 makes replicas shareable across rules — for
+    the add/edit-rule modal's "also used by" badge, not an error.
+    """
+    target = normalize_replica_path(path)
+    return [
+        rule
+        for rule in config.rules
+        if rule.id != exclude_rule_id
+        and any(normalize_replica_path(replica) == target for replica in rule.replicas)
+    ]
 
 
 def _require_str(table: dict, key: str) -> str:

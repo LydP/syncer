@@ -194,18 +194,21 @@ def reconcile_with_config(state: State, config: Config) -> State:
         if rule_id not in configured:
             continue
         replica_paths, masters_by_key = configured[rule_id]
-        rules[rule_id] = {
-            p: replace(
-                r,
-                files={
-                    rel_path: entry
-                    for rel_path, entry in r.files.items()
-                    if is_owned_landing_path(masters_by_key, rel_path)
-                },
-            )
-            for p, r in replicas.items()
-            if p in replica_paths
-        }
+        kept = {}
+        for p, r in replicas.items():
+            if p not in replica_paths:
+                continue
+            files = {
+                rel_path: entry
+                for rel_path, entry in r.files.items()
+                if is_owned_landing_path(masters_by_key, rel_path)
+            }
+            # Reuse the existing ReplicaState when nothing was purged, so
+            # reconcile_and_save's `reconciled != state` can settle on identity
+            # instead of walking every BaselineEntry — this runs at startup and
+            # on every GUI rule change, where purging nothing is the norm.
+            kept[p] = r if len(files) == len(r.files) else replace(r, files=files)
+        rules[rule_id] = kept
     return replace(state, rules=rules)
 
 
