@@ -13,6 +13,7 @@ so the workflow never re-parses `pyproject.toml` or names the build's layout.
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import subprocess
 import sys
@@ -24,6 +25,24 @@ ENTRY_POINT = REPO_ROOT / "src" / "syncer" / "app.py"
 OUTPUT_DIR = REPO_ROOT / "dist"
 # Nuitka names the standalone folder after the entry point.
 DIST_DIR_NAME = f"{ENTRY_POINT.stem}.dist"
+# Ships at the build's own root, so an app update (issue #31) knows exactly
+# which files belong to this build.
+MANIFEST_FILENAME = "app-update-manifest.json"
+
+
+def write_manifest(dist_dir: Path) -> None:
+    """List every file Nuitka produced (relative paths, POSIX separators),
+    including the manifest itself, so an app update can swap exactly this
+    build's files and remove whatever an older manifest listed that this one
+    doesn't. Only `dist_dir` is scanned, so user data (which never lives
+    there at build time) can't end up listed — and later deleted."""
+    files = sorted(
+        {p.relative_to(dist_dir).as_posix() for p in dist_dir.rglob("*") if p.is_file()}
+        | {MANIFEST_FILENAME}
+    )
+    (dist_dir / MANIFEST_FILENAME).write_text(
+        json.dumps(files, indent=2) + "\n", encoding="utf-8"
+    )
 
 
 def read_project_metadata() -> dict:
@@ -72,8 +91,15 @@ def main() -> int:
     ]
     print("Running:", " ".join(args))
     returncode = subprocess.run(args, cwd=REPO_ROOT).returncode
-    if returncode or release_tag is None:
+    if returncode:
         return returncode
+
+    # Every standalone build, not just tagged releases, so a local build
+    # always matches what a release would ship.
+    write_manifest(OUTPUT_DIR / DIST_DIR_NAME)
+
+    if release_tag is None:
+        return 0
 
     archive = shutil.make_archive(
         str(OUTPUT_DIR / f"{name}-v{version}-windows"),
