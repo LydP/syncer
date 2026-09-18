@@ -3,6 +3,17 @@ from importlib.metadata import PackageNotFoundError, version
 PROJECT_NAME = "syncer"
 
 
+def release_tag(version: str) -> str:
+    """The git tag a release of `version` is published under."""
+    return f"v{version}"
+
+
+def release_asset_name(version: str) -> str:
+    """The zipped standalone build attached to a release of `version` —
+    named once here so the build script and the update check can't drift."""
+    return f"{PROJECT_NAME}-{release_tag(version)}-windows.zip"
+
+
 def app_version() -> str | None:
     """The installed distribution's version, or None when its metadata is absent.
 

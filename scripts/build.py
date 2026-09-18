@@ -20,6 +20,8 @@ import sys
 import tomllib
 from pathlib import Path
 
+import syncer
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ENTRY_POINT = REPO_ROOT / "src" / "syncer" / "app.py"
 OUTPUT_DIR = REPO_ROOT / "dist"
@@ -63,7 +65,7 @@ def main() -> int:
     project = read_project_metadata()
     name = project["name"]
     version = project["version"]
-    if release_tag is not None and release_tag != f"v{version}":
+    if release_tag is not None and release_tag != syncer.release_tag(version):
         print(
             f"Tag {release_tag} does not match pyproject.toml version {version}",
             file=sys.stderr,
@@ -102,7 +104,8 @@ def main() -> int:
         return 0
 
     archive = shutil.make_archive(
-        str(OUTPUT_DIR / f"{name}-v{version}-windows"),
+        # make_archive appends the .zip itself.
+        str((OUTPUT_DIR / syncer.release_asset_name(version)).with_suffix("")),
         "zip",
         root_dir=OUTPUT_DIR,
         base_dir=DIST_DIR_NAME,
