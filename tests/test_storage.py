@@ -17,13 +17,10 @@ from syncer.storage import (
 
 
 def _fake_compiled_exe(tmp_path, monkeypatch, *, standalone: bool) -> Path:
-    """Stand in for a Nuitka build: an exe on disk plus the `__compiled__` marker."""
+    """Stand in for a Nuitka build: the `__compiled__` marker plus an exe path."""
     fake_exe = tmp_path / "install" / "syncer.exe"
-    fake_exe.parent.mkdir()
-    fake_exe.touch()
-    monkeypatch.setitem(
-        storage.__dict__, "__compiled__", SimpleNamespace(standalone=standalone)
-    )
+    marker = SimpleNamespace(standalone=standalone)
+    monkeypatch.setattr(storage, "__compiled__", marker, raising=False)
     monkeypatch.setattr(sys, "executable", str(fake_exe))
     return fake_exe
 
@@ -45,9 +42,8 @@ def test_resolve_base_dir_uses_executable_dir_when_nuitka_standalone(tmp_path, m
 def test_resolve_base_dir_ignores_executable_dir_when_compiled_but_not_standalone(
     tmp_path, monkeypatch
 ):
-    # A non-standalone compile still defines __compiled__, but sys.executable is
-    # the interpreter -- adopting its directory would silently make an arbitrary
-    # directory `base_dir`, which ADR 0001 forbids.
+    # Adopting the interpreter's directory here is the silent fallback ADR 0001
+    # forbids; see `storage._is_standalone_build` for why the marker alone lies.
     fake_exe = _fake_compiled_exe(tmp_path, monkeypatch, standalone=False)
 
     base_dir = resolve_base_dir()

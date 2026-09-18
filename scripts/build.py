@@ -18,13 +18,17 @@ ENTRY_POINT = REPO_ROOT / "src" / "syncer" / "app.py"
 OUTPUT_DIR = REPO_ROOT / "dist"
 
 
-def read_version() -> str:
+def read_project_metadata() -> dict:
+    """The `[project]` table: ADR 0003's single source of truth for the version,
+    and for the name and description the built exe advertises."""
     with (REPO_ROOT / "pyproject.toml").open("rb") as fh:
-        return tomllib.load(fh)["project"]["version"]
+        return tomllib.load(fh)["project"]
 
 
 def main() -> int:
-    version = read_version()
+    project = read_project_metadata()
+    name = project["name"]
+    version = project["version"]
     args = [
         sys.executable,
         "-m",
@@ -34,19 +38,18 @@ def main() -> int:
         "--assume-yes-for-downloads",
         # ADR 0003: the app reads its version at runtime via
         # importlib.metadata, which needs the dist-info bundled.
-        "--include-distribution-metadata=syncer",
+        f"--include-distribution-metadata={name}",
         f"--output-dir={OUTPUT_DIR}",
-        "--output-filename=syncer.exe",
+        f"--output-filename={name}.exe",
         "--windows-console-mode=disable",
         "--product-name=Syncer",
-        "--file-description=Syncer",
+        f"--file-description={project['description']}",
         f"--file-version={version}",
         f"--product-version={version}",
         str(ENTRY_POINT),
     ]
     print("Running:", " ".join(args))
-    result = subprocess.run(args, cwd=REPO_ROOT)
-    return result.returncode
+    return subprocess.run(args, cwd=REPO_ROOT).returncode
 
 
 if __name__ == "__main__":

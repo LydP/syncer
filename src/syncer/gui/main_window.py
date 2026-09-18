@@ -33,7 +33,7 @@ from syncer.config import (
 from syncer.gui.review_pane import ReviewPane
 from syncer.gui.rule_dialog import RuleDialog
 from syncer.state import State, reconcile_and_save
-from syncer.storage import StorageLayout, SyncerError
+from syncer.storage import StorageLayout, SyncerError, app_version
 
 _EMPTY_STATE_TEXT = "No sync rules yet — click + Add rule to get started."
 
@@ -66,7 +66,8 @@ class MainWindow(QMainWindow):
         parent=None,
     ):
         super().__init__(parent)
-        self.setWindowTitle("Syncer")
+        version = app_version()
+        self.setWindowTitle(f"Syncer v{version}" if version else "Syncer")
         self.resize(1100, 720)
         self._state_path = layout.state_path
         self._config_store = config_store
