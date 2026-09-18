@@ -1,6 +1,6 @@
 [project]
 name = "syncer"
-version = "0.1.0"
+version = "0.2.0"
 description = "Offline, Windows-only one-way file/folder sync tool."
 requires-python = ">=3.11"
 dependencies = [
