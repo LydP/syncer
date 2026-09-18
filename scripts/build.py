@@ -23,7 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 ENTRY_POINT = REPO_ROOT / "src" / "syncer" / "app.py"
 OUTPUT_DIR = REPO_ROOT / "dist"
 # Nuitka names the standalone folder after the entry point.
-DIST_DIR = OUTPUT_DIR / f"{ENTRY_POINT.stem}.dist"
+DIST_DIR_NAME = f"{ENTRY_POINT.stem}.dist"
 
 
 def read_project_metadata() -> dict:
@@ -76,10 +76,10 @@ def main() -> int:
         return returncode
 
     archive = shutil.make_archive(
-        str(OUTPUT_DIR / f"{name}-{release_tag}-windows"),
+        str(OUTPUT_DIR / f"{name}-v{version}-windows"),
         "zip",
         root_dir=OUTPUT_DIR,
-        base_dir=DIST_DIR.name,
+        base_dir=DIST_DIR_NAME,
     )
     print("Archived:", archive)
     return 0
