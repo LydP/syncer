@@ -158,6 +158,9 @@ class ReviewPane(QWidget):
     """
 
     conflictsRequested = Signal(str, str)  # rule_id, replica_path — issue #7's hook
+    # True while any rule is being checked or queued to be; the host gates
+    # actions that mustn't overlap a check (e.g. an app update) on it.
+    checkingChanged = Signal(bool)
 
     def __init__(
         self,
@@ -340,6 +343,15 @@ class ReviewPane(QWidget):
             self._worker.cancel()
             self._worker.wait()
 
+    def _set_checking(self, checking: bool) -> None:
+        """The one place the Check/Cancel buttons and `checkingChanged` change,
+        so they can't drift apart; emits only on an actual transition."""
+        if self.btn_check.isEnabled() != checking:
+            return
+        self.btn_check.setEnabled(not checking)
+        self.btn_cancel_check.setVisible(checking)
+        self.checkingChanged.emit(checking)
+
     def _run_next_check(self) -> None:
         if self._worker is not None:
             # Already mid-check; its `finished` drains the queue next — avoids
@@ -352,14 +364,12 @@ class ReviewPane(QWidget):
                 "Check cancelled." if self._check_cancelled else "Check complete."
             )
             self._check_cancelled = False
-            self.btn_cancel_check.hide()
-            self.btn_check.setEnabled(True)
+            self._set_checking(False)
             return
         rule_id = self._pending_check_ids.pop(0)
         rule = self._rules_by_id[rule_id]
         self.status_label.setText(f"Checking {rule.name}…")
-        self.btn_check.setEnabled(False)
-        self.btn_cancel_check.show()
+        self._set_checking(True)
         self._worker = CheckWorker(
             rule, baseline_for_rule(self._state, rule_id), self._namespace_collisions, self
         )

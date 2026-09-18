@@ -1,5 +1,6 @@
 """Qt adapter for the main window (issue #8, spec.md §10): rule add/edit/
-delete, the first-run empty state, and config-reload reconciliation.
+delete, the first-run empty state, config-reload reconciliation, and the
+Help -> Check for updates... entry point (issue #37).
 
 Thin wiring only — matches review_pane.py/conflict_dialog.py's convention:
 save/reconcile decisions call straight into syncer.config/syncer.state (pure,
@@ -12,6 +13,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
+    QApplication,
     QLabel,
     QMainWindow,
     QMenu,
@@ -33,8 +35,10 @@ from syncer.config import (
 )
 from syncer.gui.review_pane import ReviewPane
 from syncer.gui.rule_dialog import RuleDialog
+from syncer.gui.update_dialog import UpdateDialog
 from syncer.state import State, reconcile_and_save
 from syncer.storage import StorageLayout, SyncerError
+from syncer.update_apply import PreparedUpdate, install_update
 
 _EMPTY_STATE_TEXT = "No sync rules yet — click + Add rule to get started."
 
@@ -70,7 +74,7 @@ class MainWindow(QMainWindow):
         version = app_version()
         self.setWindowTitle(f"Syncer v{version}" if version else "Syncer")
         self.resize(1100, 720)
-        self._state_path = layout.state_path
+        self._storage = layout
         self._config_store = config_store
         self._config = config
 
@@ -91,6 +95,7 @@ class MainWindow(QMainWindow):
         self.review_pane.rule_list.currentRowChanged.connect(self._refresh_toolbar_state)
 
         self._build_toolbar()
+        self._build_menu()
         self._refresh_view()
 
     # -- chrome --------------------------------------------------------
@@ -112,6 +117,16 @@ class MainWindow(QMainWindow):
             toolbar.addAction(action)
         toolbar.addSeparator()
         toolbar.addAction(self.action_reload)
+
+    def _build_menu(self) -> None:
+        self.action_check_updates = QAction("Check for &updates…", self)
+        self.action_check_updates.triggered.connect(self._check_for_updates)
+        self.menuBar().addMenu("&Help").addAction(self.action_check_updates)
+        # A sync runs synchronously on this thread, so it can't overlap a click
+        # here; only a check, which runs in a worker, needs gating on.
+        self.review_pane.checkingChanged.connect(
+            lambda checking: self.action_check_updates.setEnabled(not checking)
+        )
 
     def _refresh_toolbar_state(self, _row: int | None = None) -> None:
         has_selection = self.review_pane.current_rule_id is not None
@@ -189,6 +204,51 @@ class MainWindow(QMainWindow):
             return
         self._adopt_config(config)
 
+    # -- app update ------------------------------------------------------
+
+    def _check_for_updates(self) -> None:
+        dialog = UpdateDialog(self._storage, self)
+        try:
+            dialog.exec()
+            prepared = dialog.prepared
+        finally:
+            dialog.deleteLater()
+        if prepared is not None:
+            self._install_update(prepared)
+
+    def _install_update(self, prepared: PreparedUpdate) -> None:
+        """Swap the downloaded build in and supervise it starting (ADR 0004).
+
+        Runs on the GUI thread with the window hidden, so nothing can lazy-load
+        a file the swap has moved while it happens. Blocks until the new build
+        reports it launched (then this one exits) or fails to (then the old
+        build is back in place and the window reappears with the reason).
+        """
+        self.hide()
+        try:
+            install_update(prepared, self._storage).wait()
+        except SyncerError as exc:
+            # UpdateApplyError, or e.g. AlreadyRunningError from a rollback's
+            # lock retake while a hung new build still holds the lock.
+            self.show()
+            QMessageBox.critical(self, "App update", str(exc))
+            return
+        except Exception as exc:
+            # A bug, but a frozen build has no console to print it to, and the
+            # install may be half-undone: say so before re-raising.
+            self.show()
+            QMessageBox.critical(
+                self,
+                "App update",
+                f"The app update failed unexpectedly ({exc!r}). Restart Syncer "
+                "before doing anything else.",
+            )
+            raise
+        except BaseException:
+            self.show()
+            raise
+        QApplication.quit()
+
     # -- persistence -----------------------------------------------------
 
     def _save_and_adopt(self, config: Config) -> None:
@@ -205,6 +265,6 @@ class MainWindow(QMainWindow):
         configured, then hand the new rules and state to the review pane.
         """
         self._config = config
-        state = reconcile_and_save(self._state_path, self.review_pane.state, config)
+        state = reconcile_and_save(self._storage.state_path, self.review_pane.state, config)
         self.review_pane.apply_config(config.rules, state)
         self._refresh_view()
