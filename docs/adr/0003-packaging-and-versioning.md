@@ -66,12 +66,16 @@ standing up new infrastructure.
 - `pyproject.toml`'s `version` field becomes load-bearing beyond packaging metadata: it's read at
   runtime (via `importlib.metadata`) for the GUI's title bar, so it must stay in sync with what's
   actually installed — no separate runtime-only version constant.
-- Deferred, not decided: code signing and any auto-update mechanism (both irrelevant while
-  distribution is personal-only, worth revisiting once website distribution actually happens); a
-  `schema_version` field for `config.toml`/`state.json` compatibility across app versions (no
-  breaking schema change exists yet to migrate from, so adding one now would be speculative).
-  Tracked in [Packaging and versioning: decision map](https://github.com/LydP/syncer/issues/26)'s
-  Not yet specified.
+- Deferred, not decided: code signing (irrelevant while distribution is personal-only, worth
+  revisiting once website distribution actually happens); a `schema_version` field for
+  `config.toml`/`state.json` compatibility across app versions (no breaking schema change exists
+  yet to migrate from, so adding one now would be speculative). Tracked in
+  [Packaging and versioning: decision map](https://github.com/LydP/syncer/issues/26)'s Not yet
+  specified.
+- Auto-update was originally deferred here until website distribution, but the trigger turned out
+  to be tedium updating the user's own multiple machines by hand, not a wider audience. It is now
+  decided in [ADR 0004](0004-app-update.md): user-triggered and offline-by-default, distributed
+  through these same GitHub Releases zips. Code signing stays deferred.
 - Implementation tracked in the same map's child tickets: the Nuitka build script, the GUI
   version display, the GitHub Actions release workflow, and cutting a first real release
   end-to-end.
