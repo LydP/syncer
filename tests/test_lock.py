@@ -56,7 +56,7 @@ def test_acquire_lock_leaves_no_temp_files_behind(tmp_path):
 
     with pytest.raises(AlreadyRunningError):
         acquire_lock(lock_path, pid=2222, is_running=lambda pid: True)
-    release_lock(lock_path)
+    release_lock(lock_path, pid=2222)
     acquire_lock(lock_path, pid=3333, is_running=lambda pid: False)
 
     assert sorted(p.name for p in tmp_path.iterdir()) == ["syncer.lock"]
@@ -69,19 +69,30 @@ def test_pid_is_running_is_false_for_an_exited_process_whose_handle_is_still_ope
     assert pid_is_running(proc.pid) is False
 
 
-def test_release_lock_removes_the_lock_file(tmp_path):
+def test_release_lock_removes_the_lock_file_we_hold(tmp_path):
     lock_path = tmp_path / "syncer.lock"
     lock_path.write_text("4242")
 
-    release_lock(lock_path)
+    release_lock(lock_path, pid=4242)
 
     assert not lock_path.exists()
+
+
+def test_release_lock_leaves_a_lock_another_process_now_holds(tmp_path):
+    # After an app update the new build takes the lock while the old one is
+    # still exiting; the old one must not delete it.
+    lock_path = tmp_path / "syncer.lock"
+    lock_path.write_text("5555")
+
+    release_lock(lock_path, pid=4242)
+
+    assert lock_path.read_text() == "5555"
 
 
 def test_release_lock_is_a_noop_when_no_lock_file_exists(tmp_path):
     lock_path = tmp_path / "syncer.lock"
 
-    release_lock(lock_path)
+    release_lock(lock_path, pid=4242)
 
     assert not lock_path.exists()
 

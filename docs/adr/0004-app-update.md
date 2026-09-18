@@ -97,10 +97,15 @@ download is never installed.
 - `base_dir` gains a working folder, `.app-update/`. It is never listed in a manifest, and the
   check/sync machinery must never treat it as user data.
 - **Rollback only ever happens before the new build touches user data.** The success point must
-  therefore precede the first `state.json` or `config.toml` write in startup (`reconcile_and_save`
-  currently writes `state.json` during startup, so the apply ticket has to place the marker ahead
-  of it). This is what lets `schema_version` for `config.toml`/`state.json` stay deferred: no
-  cross-version file format risk exists while rollback never follows a data write.
+  therefore precede the first `state.json` or `config.toml` write in startup. In `app.py` that
+  means right after `config_store.load()` (read-only) and before `load_state`, which can
+  quarantine a corrupt `state.json`, and `reconcile_and_save`, which writes it. This is what lets
+  `schema_version` for `config.toml`/`state.json` stay deferred: no cross-version file format
+  risk exists while rollback never follows a data write.
+- The old build's renamed files stay locked while it runs, so it can't delete its own
+  `.app-update/old/`. It drops the journal (the verdict is in) and sweeps what it can; the next
+  ordinary launch clears the rest. A journal that survives a crash is settled at startup: the
+  new build launched by hand accepts it, the old build restores itself.
 - `lock.release_lock` unlinks the lock unconditionally today. It needs a PID check or a hand-off
   path so the exiting old build can't delete the new build's `syncer.lock`.
 - After the swap the old process must not lazy-load modules from the new files, so it has to

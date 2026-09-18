@@ -74,5 +74,13 @@ def acquire_lock(
         tmp_path.unlink(missing_ok=True)
 
 
-def release_lock(lock_path: Path) -> None:
-    lock_path.unlink(missing_ok=True)
+def release_lock(lock_path: Path, *, pid: int) -> None:
+    """Remove `lock_path` only if it still records `pid`.
+
+    During an app update the new build takes the lock while the old one is
+    still exiting, so an unconditional unlink would delete the new build's
+    lock. An unparseable lock isn't ours either — `acquire_lock` treats it as
+    stale and reclaims it, so leaving it is harmless.
+    """
+    if _read_lock_pid(lock_path) == pid:
+        lock_path.unlink(missing_ok=True)

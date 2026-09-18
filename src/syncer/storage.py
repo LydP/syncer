@@ -6,7 +6,7 @@ import tempfile
 import tomllib
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -39,6 +39,17 @@ class StorageLayout:
     lock_path: Path
     backups_dir: Path
     logs_dir: Path
+    # An app update's working folder (ADR 0004): transient, so not provisioned.
+    update_dir: Path
+
+    def generated_names(self) -> frozenset[str]:
+        """The top-level names, lowercased, of everything Syncer generates in
+        `base_dir` (ADR 0001) — never one of a build's own files."""
+        return frozenset(
+            getattr(self, f.name).relative_to(self.base_dir).parts[0].lower()
+            for f in fields(self)
+            if f.name != "base_dir"
+        )
 
 
 def resolve_base_dir() -> Path:
@@ -176,6 +187,7 @@ def ensure_storage_layout(base_dir: Path) -> StorageLayout:
         lock_path=base_dir / "syncer.lock",
         backups_dir=backups_dir,
         logs_dir=logs_dir,
+        update_dir=base_dir / ".app-update",
     )
 
 

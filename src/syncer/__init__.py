@@ -1,6 +1,10 @@
 from importlib.metadata import PackageNotFoundError, version
 
 PROJECT_NAME = "syncer"
+# Ships at a standalone build's root, listing that build's own files, so an
+# app update knows exactly which files to swap — named once here so the build
+# script and the update apply can't drift.
+APP_UPDATE_MANIFEST_FILENAME = "app-update-manifest.json"
 
 
 def release_tag(version: str) -> str:

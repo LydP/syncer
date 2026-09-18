@@ -27,9 +27,7 @@ ENTRY_POINT = REPO_ROOT / "src" / "syncer" / "app.py"
 OUTPUT_DIR = REPO_ROOT / "dist"
 # Nuitka names the standalone folder after the entry point.
 DIST_DIR_NAME = f"{ENTRY_POINT.stem}.dist"
-# Ships at the build's own root, so an app update (issue #31) knows exactly
-# which files belong to this build.
-MANIFEST_FILENAME = "app-update-manifest.json"
+MANIFEST_FILENAME = syncer.APP_UPDATE_MANIFEST_FILENAME
 
 
 def write_manifest(dist_dir: Path) -> None:
@@ -82,6 +80,10 @@ def main() -> int:
         # ADR 0003: the app reads its version at runtime via
         # importlib.metadata, which needs the dist-info bundled.
         f"--include-distribution-metadata={name}",
+        # ADR 0004: the app update check and download need HTTPS. Nothing in
+        # the v0.1.0 import graph reached `ssl`, so its `_ssl.pyd` wasn't
+        # bundled; naming it here keeps that from depending on import reach.
+        "--include-module=ssl",
         f"--output-dir={OUTPUT_DIR}",
         f"--output-filename={name}.exe",
         "--windows-console-mode=disable",
