@@ -65,6 +65,10 @@ _Avoid_: resolved (covers all three resolution outcomes, not just this one), ign
 The state where one of a rule's masters — the whole directory, or the one file for a file-type master — doesn't exist or can't be read at check time, as distinct from individual files having been deleted from a master that's still there. Evaluated per master: blocks ordinary sync for that master's namespace only, across every replica in the rule, until the user explicitly unlocks it, so a bad path or an unmounted drive can't masquerade as "this master deleted everything" — while the rule's other masters keep syncing normally.
 _Avoid_: master_deleted (the per-file category for content removed while the rule's master root is still present)
 
+**App update**:
+Replacing the running Syncer build with a newer released version, started only when the user explicitly asks for it. Concerns the tool itself, never masters or replicas, and must leave the user's own data (configuration, last-sync records, backups, logs) untouched.
+_Avoid_: update (bare — collides with **Sync**'s _Avoid_ list), upgrade, self-update
+
 **Cross-rule namespace collision**:
 The state where two or more sync rules that share a replica have masters landing at the same physical path within it — a folder-type master's `<basename>/` folder, or a file-type master's bare filename, whichever the colliding masters compute to. A config authoring fact, not a per-file drift: detected structurally from the rules' configuration alone, with no filesystem walk needed. Blocks ordinary sync for just that landing path, in every rule that contributes to it, while each colliding rule's other masters keep syncing normally — mirrors **Master missing**'s per-master scoping, but unlike it, has no unlock: the fix (rename a colliding master, or stop sharing the replica) is fully within the user's control, so the tool never offers to proceed anyway.
 _Avoid_: conflict (see **Conflict**'s _Avoid_ line), basename collision (the actual key is the computed landing path, so a folder-type and file-type master of the same name collide too, not just identical basenames)
