@@ -1,0 +1,36 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install dependencies
+        run: pip install -e ".[gui,build]"
+
+      # build.py fails before compiling if the tag doesn't match
+      # pyproject.toml's version, and zips the build under dist/.
+      - name: Build and zip standalone executable
+        run: python scripts/build.py --release-tag "$env:GITHUB_REF_NAME"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "$env:GITHUB_REF_NAME" (Get-ChildItem dist/*.zip).FullName --title "$env:GITHUB_REF_NAME" --generate-notes

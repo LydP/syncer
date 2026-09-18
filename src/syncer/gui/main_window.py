@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from syncer import app_version
 from syncer.config import (
     Config,
     ConfigClobberError,
@@ -33,7 +34,7 @@ from syncer.config import (
 from syncer.gui.review_pane import ReviewPane
 from syncer.gui.rule_dialog import RuleDialog
 from syncer.state import State, reconcile_and_save
-from syncer.storage import StorageLayout, SyncerError, app_version
+from syncer.storage import StorageLayout, SyncerError
 
 _EMPTY_STATE_TEXT = "No sync rules yet — click + Add rule to get started."
 
