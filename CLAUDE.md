@@ -12,8 +12,7 @@ mirroring one master resume file into many directories.
 **Application code has started.** The planning effort produced a build-ready `spec.md`, and the
 build effort is now underway, tracked as GitHub issues (see below), not local tickets. Don't infer
 an issue's status from this file — check `git status` for uncommitted work and `gh issue list`
-for open/closed state directly; GitHub's auto-close via a commit's `Closes #N` can lag behind a
-direct push to `master`, so a closed-looking issue may still show open for a while.
+for open/closed state directly.
 
 This **is a git repository** (`origin` → `github.com/LydP/syncer`). Build work is committed
 directly to `master` against GitHub issues, no feature branches.
