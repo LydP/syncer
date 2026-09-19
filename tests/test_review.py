@@ -166,6 +166,14 @@ def test_every_bucketed_category_has_a_display_label():
     assert CATEGORY_LABEL.keys() == CATEGORY_BUCKET.keys()
 
 
+def test_no_baseline_leaf_is_labelled_as_differing_with_no_sync_history():
+    rule = _rule(("skills/a.txt", "no_baseline"))
+
+    [leaf] = _master_node(rule).children
+
+    assert leaf.label == "Differs from master (no sync history)"
+
+
 def test_tally_counts_leaves_by_bucket_including_those_nested_in_folders_and_masters():
     rule = _rule(
         ("skills/a.txt", "new"),

@@ -1,5 +1,7 @@
 import time
 
+import pytest
+
 from syncer.check import BaselineEntry, FileChange, hash_file
 from syncer.config import Master, SyncRule, normalize_replica_path
 from syncer.conflict import (
@@ -7,9 +9,11 @@ from syncer.conflict import (
     apply_keep_replica,
     build_conflict_view,
     bulk_candidates_by_category,
+    changes_by_replica,
     conflict_queue,
+    summarize_overwrite,
 )
-from syncer.review import BULK_CATEGORIES, ReviewLeaf, ReviewReplica
+from syncer.review import ReviewLeaf, ReviewReplica
 from syncer.state import ReplicaState, State, load_state
 
 EMPTY_STATE = State(version=1, hash_algo="sha256", rules={})
@@ -147,7 +151,7 @@ def test_no_baseline_diffs_master_directly_against_replica_with_callout(master_a
     assert panel.title == "Master vs. replica"
     assert panel.ops is not None
     assert view.callout is not None
-    assert "no record of a previous sync" in view.callout.lower()
+    assert "no sync history" in view.callout.lower()
 
 
 # -- diff fidelity fallback ---------------------------------------------------
@@ -253,6 +257,44 @@ def test_conflict_queue_spans_every_replica_passed_in():
     assert [leaf.rel_path for leaf in queue] == ["a.txt", "b.txt"]
 
 
+def test_changes_by_replica_groups_leaves_under_their_own_replica_in_order():
+    queue = conflict_queue(
+        _review_replicas(
+            ("rep1", [("a.txt", "diverged"), ("b.txt", "no_baseline")]),
+            ("rep2", [("c.txt", "both_changed")]),
+        )
+    )
+
+    grouped = changes_by_replica(queue)
+
+    assert list(grouped) == ["rep1", "rep2"]
+    assert [c.rel_path for c in grouped["rep1"]] == ["a.txt", "b.txt"]
+    assert [c.rel_path for c in grouped["rep2"]] == ["c.txt"]
+
+
+def test_overwrite_summary_counts_files_per_category_and_replica_files_deleted():
+    changes = [
+        _change("a.txt", "diverged"),
+        _change("b.txt", "diverged"),
+        _change("c.txt", "no_baseline", baseline_present=False),
+        # Master gone and replica edited: overwriting from master deletes it.
+        _change("d.txt", "both_changed", master_present=False),
+        _change("e.txt", "both_changed"),
+    ]
+
+    summary = summarize_overwrite(changes)
+
+    assert summary.by_category == {"diverged": 2, "both_changed": 2, "no_baseline": 1}
+    assert summary.deletions == 1
+
+
+def test_overwrite_summary_of_nothing_is_empty():
+    summary = summarize_overwrite([])
+
+    assert summary.by_category == {}
+    assert summary.deletions == 0
+
+
 def test_bulk_candidates_narrows_to_the_requested_category():
     replicas = _review_replicas(
         ("rep1", [("a.txt", "diverged"), ("b.txt", "diverged"), ("c.txt", "both_changed")])
@@ -264,8 +306,12 @@ def test_bulk_candidates_narrows_to_the_requested_category():
     assert [c.rel_path for c in by_category["both_changed"]] == ["c.txt"]
 
 
-def test_no_baseline_is_never_a_bulk_category():
-    assert "no_baseline" not in BULK_CATEGORIES
+def test_bulk_candidates_include_files_with_no_sync_history():
+    replicas = _review_replicas(("rep1", [("a.txt", "no_baseline"), ("b.txt", "diverged")]))
+
+    by_category = bulk_candidates_by_category(replicas)
+
+    assert [c.rel_path for c in by_category["no_baseline"]] == ["a.txt"]
 
 
 # -- keep replica's version ----------------------------------------------------
@@ -280,7 +326,7 @@ def test_keep_replica_version_sets_kept_flag_and_baseline_to_replicas_content(
     rule = _rule(master, [replica])
     change = _change("master/a.txt", "diverged")
 
-    new_state = apply_keep_replica(rule, str(replica), [change], EMPTY_STATE, layout.state_path)
+    new_state = apply_keep_replica(rule, {str(replica): [change]}, EMPTY_STATE, layout.state_path)
 
     entry = new_state.rules["r1"][normalize_replica_path(str(replica))].files["master/a.txt"]
     assert entry.kept is True
@@ -288,6 +334,21 @@ def test_keep_replica_version_sets_kept_flag_and_baseline_to_replicas_content(
 
     reloaded = load_state(layout.state_path).state
     assert reloaded.rules["r1"][normalize_replica_path(str(replica))].files["master/a.txt"].kept is True
+
+
+def test_keep_replica_version_works_for_a_file_with_no_sync_history(master_and_replica, layout):
+    master, replica = master_and_replica
+    (master / "a.txt").write_text("master content")
+    (replica / "master" / "a.txt").write_text("replica content")
+    rule = _rule(master, [replica])
+    change = _change("master/a.txt", "no_baseline", baseline_present=False)
+
+    new_state = apply_keep_replica(rule, {str(replica): [change]}, EMPTY_STATE, layout.state_path)
+
+    entry = new_state.rules["r1"][normalize_replica_path(str(replica))].files["master/a.txt"]
+    assert entry.kept is True
+    assert entry.hash == hash_file(str(replica / "master" / "a.txt"))
+    assert entry.kept_master_hash == hash_file(str(master / "a.txt"))
 
 
 def test_keep_replica_version_leaves_other_files_and_replicas_untouched(master_and_replica, layout):
@@ -313,10 +374,51 @@ def test_keep_replica_version_leaves_other_files_and_replicas_untouched(master_a
     )
     change = _change("master/a.txt", "diverged")
 
-    new_state = apply_keep_replica(rule, str(replica), [change], starting_state, layout.state_path)
+    new_state = apply_keep_replica(rule, {str(replica): [change]}, starting_state, layout.state_path)
 
     assert new_state.rules["r1"][replica_key].files["b.txt"] == untouched_entry
     assert new_state.rules["r1"][other_replica_key].files["c.txt"] == untouched_entry
+
+
+def test_keep_replica_version_spans_every_replica_in_one_save(master_and_replica, layout):
+    master, replica = master_and_replica
+    other = master.parent / "other"
+    (other / "master").mkdir(parents=True)
+    (master / "a.txt").write_text("master content")
+    (replica / "master" / "a.txt").write_text("replica content")
+    (other / "master" / "a.txt").write_text("other content")
+    rule = _rule(master, [replica, other])
+    change = _change("master/a.txt", "no_baseline", baseline_present=False)
+
+    new_state = apply_keep_replica(
+        rule, {str(replica): [change], str(other): [change]}, EMPTY_STATE, layout.state_path
+    )
+
+    reloaded = load_state(layout.state_path).state
+    for root in (replica, other):
+        entry = reloaded.rules["r1"][normalize_replica_path(str(root))].files["master/a.txt"]
+        assert entry.kept is True
+        assert entry.hash == hash_file(str(root / "master" / "a.txt"))
+    assert reloaded == new_state
+
+
+def test_keep_replica_version_saves_nothing_if_any_replica_file_is_unreadable(
+    master_and_replica, layout
+):
+    master, replica = master_and_replica
+    other = master.parent / "other"
+    (other / "master").mkdir(parents=True)
+    (replica / "master" / "a.txt").write_text("replica content")
+    # other/master/a.txt is missing, so reading it fails.
+    rule = _rule(master, [replica, other])
+    change = _change("master/a.txt", "diverged")
+
+    with pytest.raises(OSError):
+        apply_keep_replica(
+            rule, {str(replica): [change], str(other): [change]}, EMPTY_STATE, layout.state_path
+        )
+
+    assert not layout.state_path.exists()
 
 
 def test_keep_replica_version_records_masters_hash_at_keep_time(master_and_replica, layout):
@@ -326,7 +428,7 @@ def test_keep_replica_version_records_masters_hash_at_keep_time(master_and_repli
     rule = _rule(master, [replica])
     change = _change("master/a.txt", "diverged")
 
-    new_state = apply_keep_replica(rule, str(replica), [change], EMPTY_STATE, layout.state_path)
+    new_state = apply_keep_replica(rule, {str(replica): [change]}, EMPTY_STATE, layout.state_path)
 
     entry = new_state.rules["r1"][normalize_replica_path(str(replica))].files["master/a.txt"]
     assert entry.kept_master_hash == hash_file(str(master / "a.txt"))
@@ -340,7 +442,7 @@ def test_keep_replica_version_with_master_absent_records_none_master_hash(
     rule = _rule(master, [replica])
     change = _change("master/a.txt", "both_changed", master_present=False)
 
-    new_state = apply_keep_replica(rule, str(replica), [change], EMPTY_STATE, layout.state_path)
+    new_state = apply_keep_replica(rule, {str(replica): [change]}, EMPTY_STATE, layout.state_path)
 
     entry = new_state.rules["r1"][normalize_replica_path(str(replica))].files["master/a.txt"]
     assert entry.kept_master_hash is None

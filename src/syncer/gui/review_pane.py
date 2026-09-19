@@ -50,8 +50,8 @@ from syncer.config import SyncRule, master_basename
 from syncer.conflict import apply_keep_replica, bulk_candidates_by_category, conflict_queue
 from syncer.gui.conflict_dialog import ConflictDialog, bulk_overwrite
 from syncer.review import (
-    BULK_CATEGORIES,
     CATEGORY_LABEL,
+    CONFLICT_CATEGORIES,
     LeafKey,
     ReviewLeaf,
     ReviewMaster,
@@ -663,7 +663,7 @@ class ReviewPane(QWidget):
                 lambda checked=False: self._open_conflict_dialog(rule_id, replica_path)
             )
             menu.addSeparator()
-        for category in BULK_CATEGORIES:
+        for category in CONFLICT_CATEGORIES:
             candidates = by_category.get(category)
             if not candidates:
                 continue
@@ -685,7 +685,7 @@ class ReviewPane(QWidget):
         rule = self._rules_by_id[rule_id]
         try:
             self._state = apply_keep_replica(
-                rule, replica_path, changes, self._state, self._state_path
+                rule, {replica_path: changes}, self._state, self._state_path
             )
         except OSError as exc:
             # Nothing is merged or saved unless every file could be read.
@@ -695,12 +695,12 @@ class ReviewPane(QWidget):
 
     def _bulk_overwrite(self, rule_id: str, replica_path: str, changes) -> None:
         rule = self._rules_by_id[rule_id]
-        new_state = bulk_overwrite(
-            self, rule, replica_path, changes, self._state, self._state_path, self._logs_dir
+        result = bulk_overwrite(
+            self, rule, {replica_path: changes}, self._state, self._state_path, self._logs_dir
         )
-        if new_state is None:
+        if result is None:
             return  # cancelled at the confirm prompt — nothing applied
-        self._state = new_state
+        self._state = result.state
         self._queue_check(rule_id)
 
     def _sync_all_safe(self) -> None:

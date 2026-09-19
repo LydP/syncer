@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import difflib
 import os
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -23,7 +23,7 @@ from syncer.config import (
     normalize_replica_path,
     replica_abs_path,
 )
-from syncer.review import BULK_CATEGORIES, ReviewLeaf, ReviewNode, ReviewReplica, iter_leaves
+from syncer.review import CONFLICT_CATEGORIES, ReviewLeaf, ReviewNode, ReviewReplica, iter_leaves
 from syncer.state import State, merge_replica_entries, save_state
 
 # Above this, a text file falls back to metadata-only (spec.md §9: "a text
@@ -69,6 +69,16 @@ class DiffPanel:
 class ConflictView:
     panels: tuple[DiffPanel, ...]
     callout: str | None = None
+
+
+@dataclass(frozen=True)
+class OverwriteSummary:
+    """What an "overwrite from master" over a batch of conflicts would do, for
+    its confirm prompt: files per category (in `CONFLICT_CATEGORIES` order, empty
+    categories omitted) and how many replica files it would delete."""
+
+    by_category: dict[str, int]
+    deletions: int
 
 
 def _stat_meta(path: str) -> FileMeta:
@@ -174,16 +184,20 @@ def _text_diff_or_fallback_panel(
 def bulk_candidates_by_category(
     nodes: Iterable[ReviewNode | ReviewReplica],
 ) -> dict[str, list[FileChange]]:
-    """`{category: [FileChange]}` for the bulk-resolvable categories under
-    `nodes` — the pools a bulk action ("Keep all as-is" / "Overwrite all from
-    master") applies to, scoped to one category at a time (spec.md §9).
+    """`{category: [FileChange]}` for the conflicts under `nodes` — the pools a
+    bulk action ("Keep all as-is" / "Overwrite all from master") applies to,
+    scoped to one category at a time (spec.md §9).
+
+    Every conflict category is bulk-resolvable, no_baseline included: on the
+    first check of a replica that already holds files, every conflict is
+    no_baseline, so per-file-only resolution made that check unworkable
+    (issue #43).
 
     One walk for every category, since the caller builds a whole menu at once.
     """
     grouped: dict[str, list[FileChange]] = defaultdict(list)
-    for leaf in iter_leaves(nodes):
-        if leaf.category in BULK_CATEGORIES:
-            grouped[leaf.category].append(leaf.file_change)
+    for leaf in conflict_queue(nodes):
+        grouped[leaf.category].append(leaf.file_change)
     return grouped
 
 
@@ -198,10 +212,26 @@ def conflict_queue(nodes: Iterable[ReviewNode | ReviewReplica]) -> list[ReviewLe
     return [leaf for leaf in iter_leaves(nodes) if leaf.bucket == "conflict"]
 
 
+def changes_by_replica(leaves: Iterable[ReviewLeaf]) -> dict[str, list[FileChange]]:
+    """`{replica_path: [FileChange]}` — the per-replica shape `sync.sync()` and
+    `apply_keep_replica` both take, for a bulk action spanning several replicas."""
+    grouped: dict[str, list[FileChange]] = defaultdict(list)
+    for leaf in leaves:
+        grouped[leaf.replica_path].append(leaf.file_change)
+    return dict(grouped)
+
+
+def summarize_overwrite(changes: list[FileChange]) -> OverwriteSummary:
+    counts = Counter(change.category for change in changes)
+    return OverwriteSummary(
+        by_category={c: counts[c] for c in CONFLICT_CATEGORIES if counts[c]},
+        deletions=sum(change.is_deletion for change in changes),
+    )
+
+
 def apply_keep_replica(
     rule: SyncRule,
-    replica_root: str,
-    changes: list[FileChange],
+    changes_by_replica: dict[str, list[FileChange]],
     state: State,
     state_path: Path,
 ) -> State:
@@ -210,27 +240,40 @@ def apply_keep_replica(
     `kept=True` — no bytes are copied anywhere, unlike "Overwrite from
     master" which is just `sync.sync()` with these same changes.
 
-    An empty `changes` is a no-op returning `state` untouched, so callers
-    needn't guard: merging nothing would still bump `last_sync`.
+    Takes the same `{replica_path: [FileChange]}` shape `sync.sync()` does.
+    All or nothing: every file is read before anything is merged, and state
+    is saved once. Replicas with no changes are skipped, and an all-empty
+    mapping returns `state` untouched, so callers needn't guard: merging
+    nothing would still bump `last_sync`.
     """
-    if not changes:
-        return state
     masters_by_key = masters_by_basename_key(rule.masters)
-    updates = {}
-    for change in changes:
-        master_abs = master_abs_path(masters_by_key, change.rel_path)
-        updates[change.rel_path] = baseline_from_disk(
-            replica_abs_path(replica_root, change.rel_path),
-            kept=True,
-            kept_master_hash=hash_file(master_abs) if os.path.isfile(master_abs) else None,
+    # Replicas of one rule share masters, so each master file is hashed once.
+    master_hashes: dict[str, str | None] = {}
+    updates_by_replica = {}
+    for replica_root, changes in changes_by_replica.items():
+        if not changes:
+            continue
+        updates = {}
+        for change in changes:
+            master_abs = master_abs_path(masters_by_key, change.rel_path)
+            if master_abs not in master_hashes:
+                master_hashes[master_abs] = (
+                    hash_file(master_abs) if os.path.isfile(master_abs) else None
+                )
+            updates[change.rel_path] = baseline_from_disk(
+                replica_abs_path(replica_root, change.rel_path),
+                kept=True,
+                kept_master_hash=master_hashes[master_abs],
+            )
+        updates_by_replica[replica_root] = updates
+    if not updates_by_replica:
+        return state
+    now = datetime.now(timezone.utc)
+    new_state = state
+    for replica_root, updates in updates_by_replica.items():
+        new_state = merge_replica_entries(
+            new_state, rule.id, normalize_replica_path(replica_root), updates, now=now
         )
-    new_state = merge_replica_entries(
-        state,
-        rule.id,
-        normalize_replica_path(replica_root),
-        updates,
-        now=datetime.now(timezone.utc),
-    )
     save_state(state_path, new_state)
     return new_state
 
@@ -268,7 +311,10 @@ def build_conflict_view(rule: SyncRule, replica_root: str, change: FileChange) -
         )
         return ConflictView(
             (panel,),
-            callout="No record of a previous sync for this file — can't confirm what changed.",
+            callout=(
+                "This file differs from master and has no sync history, so there's "
+                "no way to tell which side changed."
+            ),
         )
 
     # diverged: master's hash still equals baseline's, so master's current

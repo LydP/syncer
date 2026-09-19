@@ -26,9 +26,18 @@ from PySide6.QtWidgets import (
 
 from syncer.check import FileChange
 from syncer.config import SyncRule
-from syncer.conflict import DiffOp, DiffPanel, FileMeta, apply_keep_replica, build_conflict_view
-from syncer.review import ReviewLeaf
+from syncer.conflict import (
+    DiffOp,
+    DiffPanel,
+    FileMeta,
+    apply_keep_replica,
+    build_conflict_view,
+    changes_by_replica,
+    summarize_overwrite,
+)
+from syncer.review import CATEGORY_LABEL, ReviewLeaf
 from syncer.state import State
+from syncer.sync import SyncResult
 from syncer.sync import sync as run_sync
 
 _CALLOUT_STYLE = "color: #b35900; font-weight: bold;"
@@ -139,23 +148,44 @@ class ConflictDialog(QDialog):
         self.btn_close = QPushButton("Close")
         self.btn_close.clicked.connect(self.reject)
 
+        # Act on the current file and everything after it (issue #43); the
+        # counts are refreshed by _show_current as the queue advances.
+        self.btn_overwrite_all = QPushButton()
+        self.btn_keep_all = QPushButton()
+        self.btn_overwrite_all.clicked.connect(self._overwrite_all_remaining)
+        self.btn_keep_all.clicked.connect(self._keep_all_remaining)
+
         button_row = QHBoxLayout()
         for button in (self.btn_overwrite, self.btn_skip, self.btn_keep):
             button_row.addWidget(button)
         button_row.addStretch(1)
         button_row.addWidget(self.btn_close)
 
+        bulk_row = QHBoxLayout()
+        bulk_row.addWidget(self.btn_overwrite_all)
+        bulk_row.addWidget(self.btn_keep_all)
+        bulk_row.addStretch(1)
+        # Redundant on the per-file "Resolve" entry point's one-item queue.
+        for button in (self.btn_overwrite_all, self.btn_keep_all):
+            button.setVisible(len(queue) > 1)
+
         layout = QVBoxLayout(self)
         layout.addWidget(self._position_label)
         layout.addWidget(self._file_label)
         layout.addWidget(self._callout_label)
         layout.addLayout(self._panels_layout, 1)
+        layout.addLayout(bulk_row)
         layout.addLayout(button_row)
 
         self._show_current()
 
     def _current_leaf(self) -> ReviewLeaf | None:
         return self._queue[self._index] if self._index < len(self._queue) else None
+
+    def _remaining(self) -> list[ReviewLeaf]:
+        # What the "…all remaining" buttons act on: the current file onward,
+        # across categories. Files skipped earlier are left alone (issue #43).
+        return self._queue[self._index :]
 
     def _clear_panels(self) -> None:
         while self._panels_layout.count():
@@ -174,6 +204,9 @@ class ConflictDialog(QDialog):
             self.accept()
             return
         self._position_label.setText(f"{self._index + 1} of {len(self._queue)}")
+        n_remaining = len(self._queue) - self._index
+        self.btn_overwrite_all.setText(f"Overwrite all remaining from master ({n_remaining})")
+        self.btn_keep_all.setText(f"Keep all remaining as-is ({n_remaining})")
         self._file_label.setText(f"{leaf.replica_path}\n{leaf.rel_path} — {leaf.label}")
         view = build_conflict_view(self._rule, leaf.replica_path, leaf.file_change)
         self._callout_label.setVisible(view.callout is not None)
@@ -218,13 +251,45 @@ class ConflictDialog(QDialog):
             return
         try:
             self.state = apply_keep_replica(
-                self._rule, leaf.replica_path, [leaf.file_change], self.state, self._state_path
+                self._rule,
+                {leaf.replica_path: [leaf.file_change]},
+                self.state,
+                self._state_path,
             )
         except OSError as exc:
             QMessageBox.warning(self, "Couldn't keep replica's version", str(exc))
             return
         self.resolved_any = True
         self._advance()
+
+    def _keep_all_remaining(self) -> None:
+        # Records the replica's version as kept (unlike Skip, which leaves no
+        # record). Changes no files, so it needs no confirm.
+        try:
+            self.state = apply_keep_replica(
+                self._rule, changes_by_replica(self._remaining()), self.state, self._state_path
+            )
+        except OSError as exc:
+            QMessageBox.warning(self, "Couldn't keep replica's version", str(exc))
+            return
+        self.resolved_any = True
+        self.accept()
+
+    def _overwrite_all_remaining(self) -> None:
+        result = bulk_overwrite(
+            self,
+            self._rule,
+            changes_by_replica(self._remaining()),
+            self.state,
+            self._state_path,
+            self._logs_dir,
+        )
+        if result is None:
+            return
+        self.state = result.state
+        if result.copied or result.deleted:
+            self.resolved_any = True
+            self.accept()
 
 
 def _confirm_deletion(parent, rel_path: str) -> bool:
@@ -241,14 +306,21 @@ def _confirm_deletion(parent, rel_path: str) -> bool:
     return box.clickedButton() is confirm
 
 
-def confirm_bulk_overwrite(parent, changes: list[FileChange]) -> bool:
+def confirm_bulk_overwrite(parent, changes: list[FileChange], replica_count: int) -> bool:
     n = len(changes)
-    n_deletions = sum(change.is_deletion for change in changes)
+    summary = summarize_overwrite(changes)
     box = QMessageBox(QMessageBox.Question, "Overwrite from master", "", parent=parent)
-    text = f"This discards {n} local edit(s) — overwrite from master?"
-    if n_deletions:
+    breakdown = "\n".join(
+        f"  {CATEGORY_LABEL[category]}: {count}" for category, count in summary.by_category.items()
+    )
+    where = "the replica" if replica_count == 1 else f"{replica_count} replicas"
+    text = (
+        f"Overwrite {n} file(s) in {where} with master's version?\n\n{breakdown}\n\n"
+        "This can't be undone."
+    )
+    if summary.deletions:
         text += (
-            f"\n\n{n_deletions} of these were deleted from the master, so those "
+            f"\n\n{summary.deletions} of these were deleted from the master, so those "
             "replica files will be deleted."
         )
     box.setText(text)
@@ -261,12 +333,11 @@ def confirm_bulk_overwrite(parent, changes: list[FileChange]) -> bool:
 def bulk_overwrite(
     parent,
     rule: SyncRule,
-    replica_path: str,
-    changes: list[FileChange],
+    changes_by_replica: dict[str, list[FileChange]],
     state: State,
     state_path: Path,
     logs_dir: Path,
-) -> State | None:
+) -> SyncResult | None:
     """"Overwrite all from master" (spec.md §9): gated behind its own
     confirm, since it discards local edits; a plain `sync.sync()` call once
     confirmed — identical to the safe-drift path.
@@ -274,10 +345,12 @@ def bulk_overwrite(
     Returns `None` when the user cancels, so "cancelled" stays distinct from
     "applied, and the state happens to be unchanged".
     """
-    if not changes or not confirm_bulk_overwrite(parent, changes):
+    changes = [change for group in changes_by_replica.values() for change in group]
+    replica_count = sum(1 for group in changes_by_replica.values() if group)
+    if not changes or not confirm_bulk_overwrite(parent, changes, replica_count):
         return None
-    result = run_sync(rule, {replica_path: changes}, state, state_path, logs_dir)
+    result = run_sync(rule, changes_by_replica, state, state_path, logs_dir)
     if result.errors:
         detail = "\n".join(f"{e.rel_path}: {e.message}" for e in result.errors)
         QMessageBox.warning(parent, "Finished with errors", detail)
-    return result.state
+    return result

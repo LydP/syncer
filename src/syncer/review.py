@@ -48,14 +48,15 @@ CATEGORY_BUCKET: dict[str, str] = {
 }
 
 # Plain-text labels only — no glyphs (spec.md §5/§7: "the user does not want
-# symbols to learn"). Verbatim from spec.md §5's taxonomy table.
+# symbols to learn"). Verbatim from spec.md §5's taxonomy table, except
+# no_baseline, reworded in issue #43.
 CATEGORY_LABEL: dict[str, str] = {
     "in_sync": "In sync",
     "new": "Missing from replica",
     "changed": "Updated in master",
     "diverged": "Edited in this replica since last sync",
     "both_changed": "Changed in master and replica",
-    "no_baseline": "No record of a previous sync — can't compare",
+    "no_baseline": "Differs from master (no sync history)",
     "master_deleted": "Deleted from master",
     "replica_only": "Only in the replica",
     "unreadable": "Couldn't read this file",
@@ -65,11 +66,9 @@ CATEGORY_LABEL: dict[str, str] = {
 BUCKETS = ("safe", "delete", "conflict", "context")
 CHECKABLE_BUCKETS = frozenset({"safe", "delete"})
 
-# Derived from CATEGORY_BUCKET so the taxonomy keeps one owner. Tuples, not
-# sets, because both drive user-visible ordering (see BUCKETS).
+# Derived from CATEGORY_BUCKET so the taxonomy keeps one owner. A tuple, not a
+# set, because it drives user-visible ordering (see BUCKETS).
 CONFLICT_CATEGORIES = tuple(c for c, bucket in CATEGORY_BUCKET.items() if bucket == "conflict")
-# no_baseline is always resolved per-file (spec.md §9) — never in bulk.
-BULK_CATEGORIES = tuple(c for c in CONFLICT_CATEGORIES if c != "no_baseline")
 
 
 class LeafKey(NamedTuple):
