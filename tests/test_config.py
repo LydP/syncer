@@ -1,5 +1,6 @@
 import os
 import re
+from dataclasses import replace
 
 import pytest
 
@@ -10,18 +11,23 @@ from syncer.config import (
     ConfigStore,
     DuplicateMasterError,
     DuplicateMasterPathError,
+    DuplicateReplicaNameError,
     DuplicateRuleNameError,
     MAX_CONFIG_BACKUPS,
     Master,
+    ReplicaName,
     SyncRule,
     default_rule_name,
     find_master_conflict,
     find_name_conflict,
+    find_replica_name_conflict,
     find_replica_sharers,
     load_config,
     native_path,
     normalize_replica_path,
+    replica_label,
     save_config,
+    with_replica_name,
     with_rule,
     without_rule,
 )
@@ -418,6 +424,201 @@ def test_save_config_round_trips_a_rule_with_several_masters(layout):
     save_config(layout.config_path, config, layout.backups_dir)
 
     assert load_config(layout.config_path) == config
+
+
+def test_save_config_round_trips_a_replica_name(layout):
+    config = Config(
+        version=1,
+        rules=[
+            _rule(
+                "11111111-1111-4111-8111-111111111111",
+                Master(path=r"C:\MyStuff\skills\wayfinder", type="dir"),
+                replicas=[r"C:\ProjectA\.claude\skills"],
+            )
+        ],
+        replica_names=[ReplicaName(path=r"C:\ProjectA\.claude\skills", name="Project A")],
+    )
+
+    save_config(layout.config_path, config, layout.backups_dir)
+
+    assert load_config(layout.config_path) == config
+
+
+def _config_with_named_replicas(*named):
+    """A config whose one rule lists every replica in `named`, a list of (path, name)."""
+    return Config(
+        version=1,
+        rules=[
+            _rule(
+                "11111111-1111-4111-8111-111111111111",
+                Master(path=r"C:\MyStuff\skills\wayfinder", type="dir"),
+                replicas=[path for path, _ in named],
+            )
+        ],
+        replica_names=[ReplicaName(path=path, name=name) for path, name in named],
+    )
+
+
+def test_save_config_treats_a_blank_replica_name_as_no_name(layout):
+    config = _config_with_named_replicas(
+        (r"C:\ProjectA", "  "), (r"C:\ProjectB", ""), (r"C:\ProjectC", "Client")
+    )
+
+    save_config(layout.config_path, config, layout.backups_dir)
+
+    assert load_config(layout.config_path).replica_names == [
+        ReplicaName(path=r"C:\ProjectC", name="Client")
+    ]
+
+
+def test_save_config_drops_the_name_of_a_replica_no_rule_lists(layout):
+    config = _config_with_named_replicas((r"C:\ProjectA", "Client A"))
+    config = replace(
+        config,
+        replica_names=[*config.replica_names, ReplicaName(path=r"C:\Gone", name="Client B")],
+    )
+
+    save_config(layout.config_path, config, layout.backups_dir)
+
+    assert load_config(layout.config_path).replica_names == [
+        ReplicaName(path=r"C:\ProjectA", name="Client A")
+    ]
+
+
+def test_save_config_lets_an_orphaned_name_not_block_a_live_replica_reusing_it(layout):
+    config = _config_with_named_replicas((r"C:\ProjectA", "Client"))
+    config = replace(
+        config,
+        replica_names=[*config.replica_names, ReplicaName(path=r"C:\Gone", name="client")],
+    )
+
+    save_config(layout.config_path, config, layout.backups_dir)
+
+    assert load_config(layout.config_path).replica_names == [
+        ReplicaName(path=r"C:\ProjectA", name="Client")
+    ]
+
+
+def test_replica_label_is_the_replicas_name():
+    config = _config_with_named_replicas((r"C:\ProjectA", "Client A"))
+
+    assert replica_label(config, r"C:\ProjectA") == "Client A"
+
+
+def test_replica_label_falls_back_to_the_path_when_the_replica_has_no_name():
+    config = _config_with_named_replicas((r"C:\ProjectA", "Client A"))
+
+    assert replica_label(config, r"C:\ProjectB") == r"C:\ProjectB"
+
+
+@pytest.mark.parametrize("path", ["c:/projecta", r"C:\ProjectA\\", r"C:\Other\..\PROJECTA"])
+def test_replica_label_matches_the_path_however_it_is_spelled(path):
+    config = _config_with_named_replicas((r"C:\ProjectA", "Client A"))
+
+    assert replica_label(config, path) == "Client A"
+
+
+def test_find_replica_name_conflict_returns_the_other_replica_using_the_name_ignoring_case():
+    config = _config_with_named_replicas((r"C:\ProjectA", "Client A"), (r"C:\ProjectB", "Client B"))
+
+    conflict = find_replica_name_conflict(config, r"C:\ProjectB", "client a")
+
+    assert conflict == ReplicaName(path=r"C:\ProjectA", name="Client A")
+
+
+def test_find_replica_name_conflict_ignores_the_replica_being_named():
+    config = _config_with_named_replicas((r"C:\ProjectA", "Client A"))
+
+    assert find_replica_name_conflict(config, "c:/projecta", "CLIENT A") is None
+
+
+def test_find_replica_name_conflict_ignores_a_name_whose_replica_no_rule_lists():
+    # What a save would drop mustn't block a live replica taking the name.
+    config = _config_with_named_replicas((r"C:\ProjectA", "Client A"))
+    config = replace(
+        config,
+        replica_names=[*config.replica_names, ReplicaName(path=r"C:\Gone", name="Client B")],
+    )
+
+    assert find_replica_name_conflict(config, r"C:\ProjectA", "client b") is None
+
+
+def test_find_replica_name_conflict_never_flags_a_blank_name():
+    config = _config_with_named_replicas((r"C:\ProjectA", "Client A"))
+
+    assert find_replica_name_conflict(config, r"C:\ProjectB", "  ") is None
+
+
+def test_with_replica_name_names_a_replica_that_has_no_name_yet():
+    config = _config_with_named_replicas((r"C:\ProjectA", "Client A"))
+
+    updated = with_replica_name(config, r"C:\ProjectB", "Client B")
+
+    assert updated.replica_names == [
+        ReplicaName(path=r"C:\ProjectA", name="Client A"),
+        ReplicaName(path=r"C:\ProjectB", name="Client B"),
+    ]
+
+
+def test_with_replica_name_renames_in_place_whatever_way_the_path_is_spelled():
+    config = _config_with_named_replicas((r"C:\ProjectA", "Client A"), (r"C:\ProjectB", "Client B"))
+
+    updated = with_replica_name(config, "c:/projecta", "Acme")
+
+    assert updated.replica_names == [
+        ReplicaName(path=r"C:\ProjectA", name="Acme"),
+        ReplicaName(path=r"C:\ProjectB", name="Client B"),
+    ]
+
+
+def test_with_replica_name_clears_the_name_when_given_a_blank_one():
+    config = _config_with_named_replicas((r"C:\ProjectA", "Client A"))
+
+    assert with_replica_name(config, r"C:\ProjectA", "  ").replica_names == []
+
+
+def test_save_config_rejects_a_replica_name_used_twice_ignoring_case(layout):
+    config = _config_with_named_replicas((r"C:\ProjectA", "Client"), (r"C:\ProjectB", "client"))
+
+    with pytest.raises(DuplicateReplicaNameError):
+        save_config(layout.config_path, config, layout.backups_dir)
+
+    assert not layout.config_path.exists()
+
+
+def test_load_config_rejects_a_replica_name_used_twice_ignoring_case(layout):
+    layout.config_path.write_text(
+        CONFIG_HEADER
+        + _rule_toml(
+            "11111111-1111-4111-8111-111111111111",
+            [(r"C:\MyStuff\skills\wayfinder", "dir")],
+            replicas=[r"C:\ProjectA", r"C:\ProjectB"],
+        )
+        + "\n[[replica]]\npath = 'C:\\ProjectA'\nname = 'Client'\n"
+        "\n[[replica]]\npath = 'C:\\ProjectB'\nname = 'CLIENT'\n"
+    )
+
+    with pytest.raises(DuplicateReplicaNameError):
+        load_config(layout.config_path)
+
+
+def test_load_config_treats_blank_and_orphaned_replica_names_as_no_name(layout):
+    layout.config_path.write_text(
+        CONFIG_HEADER
+        + _rule_toml(
+            "11111111-1111-4111-8111-111111111111",
+            [(r"C:\MyStuff\skills\wayfinder", "dir")],
+            replicas=[r"C:\ProjectA", r"C:\ProjectB", r"C:\ProjectC"],
+        )
+        + "\n[[replica]]\npath = 'C:\\ProjectA'\nname = ''\n"
+        "\n[[replica]]\npath = 'C:\\ProjectB'\nname = '  '\n"
+        "\n[[replica]]\npath = 'C:\\ProjectC'\nname = 'Client'\n"
+        "\n[[replica]]\npath = 'C:\\Gone'\nname = 'client'\n"
+    )
+
+    assert load_config(layout.config_path).replica_names == [
+        ReplicaName(path=r"C:\ProjectC", name="Client")
+    ]
 
 
 @pytest.mark.parametrize(

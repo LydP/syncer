@@ -30,7 +30,6 @@ from syncer.config import (
     ConfigClobberError,
     ConfigStore,
     SyncRule,
-    with_rule,
     without_rule,
 )
 from syncer.gui.review_pane import ReviewPane
@@ -78,9 +77,7 @@ class MainWindow(QMainWindow):
         self._config_store = config_store
         self._config = config
 
-        self.review_pane = ReviewPane(
-            config.rules, state, layout.state_path, layout.logs_dir, self
-        )
+        self.review_pane = ReviewPane(config, state, layout.state_path, layout.logs_dir, self)
         self._empty_state = _EmptyStateWidget(self._add_rule, self)
 
         self._stack = QStackedWidget()
@@ -156,25 +153,27 @@ class MainWindow(QMainWindow):
 
     # -- add / edit / delete ---------------------------------------------
 
-    def _run_rule_dialog(self, existing_rule: SyncRule | None) -> SyncRule | None:
+    def _run_rule_dialog(self, existing_rule: SyncRule | None) -> Config | None:
+        """The config a save of the dialog's rule and replica names would
+        produce, or None if it was cancelled."""
         dialog = RuleDialog(self._config, existing_rule, self)
         try:
-            return dialog.result_rule if dialog.exec() == RuleDialog.Accepted else None
+            return dialog.result_config if dialog.exec() == RuleDialog.Accepted else None
         finally:
             dialog.deleteLater()  # parented to the window, so it would otherwise live until exit
 
     def _add_rule(self) -> None:
-        new_rule = self._run_rule_dialog(None)
-        if new_rule is not None:
-            self._save_and_adopt(with_rule(self._config, new_rule))
+        new_config = self._run_rule_dialog(None)
+        if new_config is not None:
+            self._save_and_adopt(new_config)
 
     def _edit_selected_rule(self) -> None:
         rule = self._selected_rule()
         if rule is None:
             return
-        edited = self._run_rule_dialog(rule)
-        if edited is not None:
-            self._save_and_adopt(with_rule(self._config, edited))
+        edited_config = self._run_rule_dialog(rule)
+        if edited_config is not None:
+            self._save_and_adopt(edited_config)
 
     def _delete_selected_rule(self) -> None:
         rule = self._selected_rule()
@@ -266,5 +265,5 @@ class MainWindow(QMainWindow):
         """
         self._config = config
         state = reconcile_and_save(self._storage.state_path, self.review_pane.state, config)
-        self.review_pane.apply_config(config.rules, state)
+        self.review_pane.apply_config(config, state)
         self._refresh_view()

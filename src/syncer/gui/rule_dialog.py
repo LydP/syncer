@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -48,10 +49,14 @@ from syncer.config import (
     default_rule_name,
     find_master_conflict,
     find_name_conflict,
+    find_replica_name_conflict,
     find_replica_sharers,
     master_basename_key,
     native_path,
     normalize_replica_path,
+    replica_label,
+    replica_name,
+    with_replica_name,
     with_rule,
 )
 from syncer.storage import BaseDirNotWritableError, ensure_base_dir_writable
@@ -85,8 +90,10 @@ class RuleDialog(QDialog):
         self._rule_id = existing_rule.id if existing_rule else str(uuid.uuid4())
         self._masters: list[Master] = list(existing_rule.masters) if existing_rule else []
         self._replicas: list[str] = list(existing_rule.replicas) if existing_rule else []
-
-        self.result_rule: SyncRule | None = None
+        # What saving the dialog produces: the edited rule plus any replica-name
+        # edits. Names are global (one path, one name in every rule), so they
+        # accumulate on self._config and land here with the rule on accept.
+        self.result_config: Config | None = None
 
         self.setWindowTitle("Edit sync rule" if existing_rule else "Add sync rule")
         self.setMinimumWidth(480)
@@ -120,12 +127,22 @@ class RuleDialog(QDialog):
 
         self.btn_browse = QPushButton("Browse…")
         self.btn_browse.clicked.connect(self._browse_replica)
+        self.btn_name_replica = QPushButton("Name…")
+        self.btn_name_replica.setEnabled(False)
+        self.btn_name_replica.clicked.connect(self._name_selected_replica)
+        self.replica_list.currentRowChanged.connect(
+            lambda row: self.btn_name_replica.setEnabled(row >= 0)
+        )
         self.btn_remove_replica = QPushButton("Remove selected")
         self.btn_remove_replica.clicked.connect(self._remove_selected_replica)
         replica_buttons = QHBoxLayout()
         replica_buttons.addWidget(self.btn_browse)
+        replica_buttons.addWidget(self.btn_name_replica)
         replica_buttons.addWidget(self.btn_remove_replica)
         replica_buttons.addStretch(1)
+        self.replica_name_error = QLabel()
+        self.replica_name_error.setStyleSheet(_ERROR_STYLE)
+        self.replica_name_error.hide()
 
         self.typed_path_edit = QLineEdit()
         self.typed_path_edit.setPlaceholderText(r"Or type/paste a path, e.g. C:\path\to\replica")
@@ -151,6 +168,7 @@ class RuleDialog(QDialog):
         layout.addWidget(self.replica_list, 1)
         layout.addLayout(typed_row)
         layout.addLayout(replica_buttons)
+        layout.addWidget(self.replica_name_error)
         layout.addWidget(self.buttons)
 
         self._refresh_master_list()
@@ -292,14 +310,44 @@ class RuleDialog(QDialog):
             del self._replicas[row]
             self._refresh_replica_list()
 
+    def _name_selected_replica(self) -> None:
+        row = self.replica_list.currentRow()
+        if row < 0:
+            return
+        path = self._replicas[row]
+        text, ok = QInputDialog.getText(
+            self,
+            "Replica name",
+            f"Name for {path}\n(shown everywhere it appears; leave blank for none):",
+            text=replica_name(self._config, path) or "",
+        )
+        if not ok:
+            return
+        # Against the draft rule set, so a name whose replica this edit removes
+        # from every rule doesn't block one that's still in use.
+        draft = with_rule(self._config, self._draft_rule())
+        conflict = find_replica_name_conflict(draft, path, text)
+        if conflict is not None:
+            self.replica_name_error.setText(
+                f"'{text.strip()}' is already the name of {conflict.path}."
+            )
+            self.replica_name_error.show()
+            return
+        self.replica_name_error.hide()
+        self._config = with_replica_name(self._config, path, text)
+        self._refresh_replica_list()
+        self.replica_list.setCurrentRow(row)
+
     def _refresh_replica_list(self) -> None:
         self.replica_list.clear()
         for replica in self._replicas:
             sharers = find_replica_sharers(self._config, replica, exclude_rule_id=self._rule_id)
-            item = QListWidgetItem(replica)
+            label = replica_label(self._config, replica)
+            item = QListWidgetItem(label)
+            item.setToolTip(replica)
             if sharers:
                 names = ", ".join(f"'{rule.name}'" for rule in sharers)
-                item.setText(f"{replica}  —  also used by: {names}")
+                item.setText(f"{label}  —  also used by: {names}")
                 item.setForeground(_INFO_BRUSH)
             self.replica_list.addItem(item)
         # A namespace-collision warning is keyed on (replica, master
@@ -334,7 +382,22 @@ class RuleDialog(QDialog):
         if self._existing_rule is not None:
             # replace(), not a field-by-field rebuild, so fields the dialog
             # doesn't edit (e.g. `ignore`) carry over untouched.
-            self.result_rule = replace(self._existing_rule, name=name, masters=masters, replicas=replicas)
+            rule = replace(self._existing_rule, name=name, masters=masters, replicas=replicas)
         else:
-            self.result_rule = SyncRule(id=self._rule_id, name=name, masters=masters, replicas=replicas)
+            rule = SyncRule(id=self._rule_id, name=name, masters=masters, replicas=replicas)
+        result_config = with_rule(self._config, rule)
+        # Naming only checks the draft at that moment: a replica removed and
+        # re-added afterwards brings its old name back, which may since have
+        # been given to another replica — and save_config would reject that.
+        for replica in replicas:
+            taken = replica_name(result_config, replica)
+            conflict = taken and find_replica_name_conflict(result_config, replica, taken)
+            if conflict:
+                self.replica_name_error.setText(
+                    f"{replica} and {conflict.path} are both named '{taken}' — rename one."
+                )
+                self.replica_name_error.show()
+                return
+        self.replica_name_error.hide()
+        self.result_config = result_config
         self.accept()

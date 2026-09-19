@@ -46,7 +46,7 @@ from syncer.check import (
     find_namespace_collisions,
     other_rule_names,
 )
-from syncer.config import SyncRule, master_basename
+from syncer.config import Config, SyncRule, master_basename, replica_label
 from syncer.conflict import apply_keep_replica, bulk_candidates_by_category, conflict_queue
 from syncer.gui.conflict_dialog import ConflictDialog, bulk_overwrite
 from syncer.review import (
@@ -164,18 +164,19 @@ class ReviewPane(QWidget):
 
     def __init__(
         self,
-        rules: list[SyncRule],
+        config: Config,
         state: State,
         state_path: Path,
         logs_dir: Path,
         parent=None,
     ):
         super().__init__(parent)
+        self._config = config
         # Insertion-ordered: also the left pane's row order.
-        self._rules_by_id: dict[str, SyncRule] = {rule.id: rule for rule in rules}
+        self._rules_by_id: dict[str, SyncRule] = {rule.id: rule for rule in config.rules}
         # Recomputed only where _rules_by_id is (here and apply_config) — not
         # per rule checked, since check_all() checks every rule in turn.
-        self._namespace_collisions: list[NamespaceCollision] = find_namespace_collisions(rules)
+        self._namespace_collisions: list[NamespaceCollision] = find_namespace_collisions(config.rules)
         self._state = state
         self._state_path = state_path
         self._logs_dir = logs_dir
@@ -279,19 +280,22 @@ class ReviewPane(QWidget):
     def current_rule_id(self) -> str | None:
         return self._current_rule_id
 
-    def apply_config(self, rules: list[SyncRule], state: State) -> None:
+    def apply_config(self, config: Config, state: State) -> None:
         """The rule set and/or state changed outside the normal check/sync
         flow — an add/edit/delete-rule action, or a config-reload's
         reconciliation purge (spec.md §10). Per-rule session state (review,
         selection, unlock) survives only for a rule whose definition is
         unchanged — an edited rule's old review would show stale replicas.
         Rebuilds the left pane's rows, keeping the current selection when the
-        selected rule survives.
+        selected rule survives. A changed replica name relabels the tree
+        without invalidating any review.
         """
         old_rules_by_id = self._rules_by_id
         old_collisions = self._namespace_collisions
-        self._rules_by_id = {rule.id: rule for rule in rules}
-        self._namespace_collisions = find_namespace_collisions(rules)
+        names_changed = config.replica_names != self._config.replica_names
+        self._config = config
+        self._rules_by_id = {rule.id: rule for rule in config.rules}
+        self._namespace_collisions = find_namespace_collisions(config.rules)
         self._state = state
         # Another rule's edit can add or clear a collision on an otherwise
         # unchanged rule, so its cached review is stale then too.
@@ -312,6 +316,10 @@ class ReviewPane(QWidget):
         self._pending_check_ids = [k for k in self._pending_check_ids if k in self._rules_by_id]
 
         self._repopulate_and_select(self._current_rule_id, unchanged)
+        if names_changed:
+            # The tree shows names, so a rename relabels it even for a rule
+            # whose cached review (and so its tree) is still accurate.
+            self._relabel_replica_items()
 
     def _queue_check(self, rule_id: str) -> None:
         """Adds one rule to the check queue without dropping rules already
@@ -510,14 +518,11 @@ class ReviewPane(QWidget):
             _make_inert(item)
         else:  # ReviewReplica, unblocked ReviewMaster, or ReviewFolder
             if isinstance(node, ReviewReplica):
-                label = node.replica_path
-                if not node.replica_exists:
-                    label += "  (missing — will be created)"
-            elif isinstance(node, ReviewMaster):
-                label = _master_label(node)
+                item = QTreeWidgetItem(parent, [self._replica_item_label(node), "", ""])
+                item.setToolTip(0, node.replica_path)
             else:
-                label = node.name
-            item = QTreeWidgetItem(parent, [label, "", ""])
+                label = _master_label(node) if isinstance(node, ReviewMaster) else node.name
+                item = QTreeWidgetItem(parent, [label, "", ""])
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             bold = item.font(0)
             bold.setWeight(QFont.Bold)
@@ -526,6 +531,21 @@ class ReviewPane(QWidget):
                 self._build_item(item, child, unlocked)
         item.setData(0, ROLE_NODE, node)
         return item
+
+    def _replica_item_label(self, node: ReviewReplica) -> str:
+        label = replica_label(self._config, node.replica_path)
+        if not node.replica_exists:
+            label += "  (missing — will be created)"
+        return label
+
+    def _relabel_replica_items(self) -> None:
+        # Blocked: setText fires itemChanged, which would toggle the tick.
+        with QSignalBlocker(self.tree):
+            for i in range(self.tree.topLevelItemCount()):
+                item = self.tree.topLevelItem(i)
+                node = item.data(0, ROLE_NODE)
+                if isinstance(node, ReviewReplica):
+                    item.setText(0, self._replica_item_label(node))
 
     def _iter_tree_items(self) -> Iterator[QTreeWidgetItem]:
         stack = [self.tree.topLevelItem(i) for i in range(self.tree.topLevelItemCount())]
@@ -631,7 +651,15 @@ class ReviewPane(QWidget):
 
     def _run_conflict_dialog(self, rule_id: str, queue: list[ReviewLeaf]) -> None:
         rule = self._rules_by_id[rule_id]
-        dialog = ConflictDialog(rule, queue, self._state, self._state_path, self._logs_dir, self)
+        dialog = ConflictDialog(
+            rule,
+            queue,
+            self._state,
+            self._state_path,
+            self._logs_dir,
+            self._config,
+            self,
+        )
         dialog.exec()
         if not dialog.resolved_any:
             return  # closed or skipped through — nothing on disk changed

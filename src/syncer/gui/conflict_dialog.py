@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from syncer.check import FileChange
-from syncer.config import SyncRule
+from syncer.config import Config, SyncRule, replica_label
 from syncer.conflict import (
     DiffOp,
     DiffPanel,
@@ -113,6 +113,7 @@ class ConflictDialog(QDialog):
         state: State,
         state_path: Path,
         logs_dir: Path,
+        config: Config,
         parent=None,
     ):
         super().__init__(parent)
@@ -123,6 +124,7 @@ class ConflictDialog(QDialog):
         self._index = 0
         self._state_path = state_path
         self._logs_dir = logs_dir
+        self._config = config
         self.state = state
         self.resolved_any = False
 
@@ -207,7 +209,10 @@ class ConflictDialog(QDialog):
         n_remaining = len(self._queue) - self._index
         self.btn_overwrite_all.setText(f"Overwrite all remaining from master ({n_remaining})")
         self.btn_keep_all.setText(f"Keep all remaining as-is ({n_remaining})")
-        self._file_label.setText(f"{leaf.replica_path}\n{leaf.rel_path} — {leaf.label}")
+        self._file_label.setText(
+            f"{replica_label(self._config, leaf.replica_path)}\n{leaf.rel_path} — {leaf.label}"
+        )
+        self._file_label.setToolTip(leaf.replica_path)
         view = build_conflict_view(self._rule, leaf.replica_path, leaf.file_change)
         self._callout_label.setVisible(view.callout is not None)
         if view.callout is not None:

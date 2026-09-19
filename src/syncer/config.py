@@ -31,6 +31,10 @@ class DuplicateRuleNameError(SyncerError):
     """Two rules share a name (case-insensitively)."""
 
 
+class DuplicateReplicaNameError(SyncerError):
+    """Two replicas share a name (case-insensitively)."""
+
+
 class ConfigClobberError(SyncerError):
     pass
 
@@ -92,9 +96,16 @@ class SyncRule:
 
 
 @dataclass(frozen=True)
+class ReplicaName:
+    path: str
+    name: str
+
+
+@dataclass(frozen=True)
 class Config:
     version: int
     rules: list[SyncRule] = field(default_factory=list)
+    replica_names: list[ReplicaName] = field(default_factory=list)
 
 
 def masters_by_basename_key(masters: list[Master]) -> dict[str, Master]:
@@ -157,6 +168,10 @@ def split_landing_path(masters_by_key: dict[str, Master], rel_path: str) -> Land
 
 def _rule_name_key(name: str) -> str:
     return name.casefold()
+
+
+def _replica_name_key(name: str) -> str:
+    return name.strip().casefold()
 
 
 def find_name_conflict(
@@ -235,6 +250,62 @@ def find_replica_sharers(
     ]
 
 
+def replica_name(config: Config, path: str) -> str | None:
+    """The name given to the replica at `path`, or None if it has none. Matched
+    on `normalize_replica_path`, so `/`, `\\` and casing differences still find
+    the one replica."""
+    target = normalize_replica_path(path)
+    for replica in config.replica_names:
+        if normalize_replica_path(replica.path) == target:
+            return replica.name
+    return None
+
+
+def find_replica_name_conflict(config: Config, path: str, name: str) -> ReplicaName | None:
+    """The other replica (if any) already named `name`, case-insensitively.
+
+    Non-raising counterpart to load_config's DuplicateReplicaNameError, for the
+    rule modal's inline validation. Checked against exactly the names a save
+    would keep (`_tidy_replica_names`), so a blank name never conflicts and a
+    name whose replica no rule lists never blocks; the replica at `path` itself
+    is never its own conflict.
+    """
+    target = _replica_name_key(name)
+    path_key = normalize_replica_path(path)
+    for replica in _tidy_replica_names(config).replica_names:
+        if (
+            _replica_name_key(replica.name) == target
+            and normalize_replica_path(replica.path) != path_key
+        ):
+            return replica
+    return None
+
+
+def with_replica_name(config: Config, path: str, name: str) -> Config:
+    """`config` with the replica at `path` named `name` — added, or renamed in
+    place — or, for a blank `name`, left with no name. `with_rule`'s sibling: the
+    one definition of what naming a replica produces."""
+    key = normalize_replica_path(path)
+    name = name.strip()
+    replica_names: list[ReplicaName] = []
+    found = False
+    for replica in config.replica_names:
+        if normalize_replica_path(replica.path) != key:
+            replica_names.append(replica)
+        elif name:
+            replica_names.append(replace(replica, name=name))  # keeps its stored path spelling
+            found = True
+    if name and not found:
+        replica_names.append(ReplicaName(path=native_path(path), name=name))
+    return replace(config, replica_names=replica_names)
+
+
+def replica_label(config: Config, path: str) -> str:
+    """What to show for the replica at `path`: its name, else the path itself.
+    The one place that rule lives, for every screen that shows a replica."""
+    return replica_name(config, path) or path
+
+
 def _require_str(table: dict, key: str) -> str:
     value = table.get(key)
     if not isinstance(value, str):
@@ -249,6 +320,13 @@ def _require_str_list(table: dict, key: str) -> list[str]:
     return value
 
 
+def _require_table_array(raw: dict, key: str, config_path: Path) -> list:
+    value = raw.get(key, [])
+    if not isinstance(value, list):
+        raise ConfigError(f"{config_path}: {key!r} must be an array of [[{key}]] tables")
+    return value
+
+
 def _parse_master(raw_master: object) -> Master:
     if not isinstance(raw_master, dict):
         raise ConfigError(f"each rule's 'masters' entry must be a table, got {raw_master!r}")
@@ -258,6 +336,15 @@ def _parse_master(raw_master: object) -> Master:
             f"master key 'type' must be one of {MASTER_TYPES}, got {master_type!r}"
         )
     return Master(path=native_path(_require_str(raw_master, "path")), type=master_type)
+
+
+def _parse_replica_name(raw_replica: object) -> ReplicaName:
+    if not isinstance(raw_replica, dict):
+        raise ConfigError(f"each [[replica]] must be a table, got {raw_replica!r}")
+    return ReplicaName(
+        path=native_path(_require_str(raw_replica, "path")),
+        name=_require_str(raw_replica, "name"),
+    )
 
 
 def _parse_rule(raw_rule: object) -> SyncRule:
@@ -316,6 +403,33 @@ def _validate_rules(rules: list[SyncRule]) -> None:
     )
 
 
+def _replica_keys_in_use(config: Config) -> set[str]:
+    return {normalize_replica_path(r) for rule in config.rules for r in rule.replicas}
+
+
+def _tidy_replica_names(config: Config) -> Config:
+    """`config` with each replica name trimmed, blank ones (meaning "no name")
+    dropped, and any whose replica path no rule lists any more dropped too."""
+    in_use = _replica_keys_in_use(config)
+    return replace(
+        config,
+        replica_names=[
+            replace(replica, name=name)
+            for replica in config.replica_names
+            if (name := replica.name.strip()) and normalize_replica_path(replica.path) in in_use
+        ],
+    )
+
+
+def _validate_replica_names(replica_names: list[ReplicaName]) -> None:
+    _reject_duplicates(
+        [replica.name for replica in replica_names],
+        DuplicateReplicaNameError,
+        "replica name used by more than one replica",
+        key=_replica_name_key,
+    )
+
+
 def load_config(config_path: Path) -> Config:
     with open(config_path, "rb") as fh:
         try:
@@ -325,20 +439,28 @@ def load_config(config_path: Path) -> Config:
     version = raw.get("version")
     if not isinstance(version, int):
         raise ConfigError(f"{config_path}: 'version' must be an integer, got {version!r}")
-    raw_rules = raw.get("rule", [])
-    if not isinstance(raw_rules, list):
-        raise ConfigError(f"{config_path}: 'rule' must be an array of [[rule]] tables")
-    rules = [_parse_rule(raw_rule) for raw_rule in raw_rules]
+    rules = [_parse_rule(raw_rule) for raw_rule in _require_table_array(raw, "rule", config_path)]
     _validate_rules(rules)
-    return Config(version=version, rules=rules)
+    replica_names = [
+        _parse_replica_name(raw_replica)
+        for raw_replica in _require_table_array(raw, "replica", config_path)
+    ]
+    # Tidied as a save would be, so a hand-edit's blank or orphaned names mean
+    # "no name" here too rather than tripping the duplicate check.
+    config = _tidy_replica_names(Config(version=version, rules=rules, replica_names=replica_names))
+    _validate_replica_names(config.replica_names)
+    return config
 
 
 def _config_to_dict(config: Config) -> dict:
-    return {
+    raw = {
         "version": config.version,
         "settings": {},
         "rule": [asdict(rule) for rule in config.rules],
     }
+    if config.replica_names:
+        raw["replica"] = [asdict(replica) for replica in config.replica_names]
+    return raw
 
 
 def _write_backup(config_path: Path, backups_dir: Path) -> None:
@@ -356,7 +478,9 @@ def _prune_old_backups(backups_dir: Path) -> None:
 
 
 def save_config(config_path: Path, config: Config, backups_dir: Path) -> None:
+    config = _tidy_replica_names(config)
     _validate_rules(config.rules)
+    _validate_replica_names(config.replica_names)
     # Back up whatever save is about to destroy, not what it just wrote — the
     # latter is already sitting live in config_path with nothing at risk.
     # Otherwise a hand-edit made between loads is overwritten with no backup
