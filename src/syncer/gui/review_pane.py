@@ -40,11 +40,13 @@ from PySide6.QtWidgets import (
 
 from syncer.check import (
     CheckResult,
+    MasterLayout,
     NamespaceCollision,
     check,
     collisions_for_rule,
     find_namespace_collisions,
     other_rule_names,
+    scan_master_layout,
 )
 from syncer.config import Config, SyncRule, master_basename, replica_label
 from syncer.conflict import apply_keep_replica, bulk_candidates_by_category, conflict_queue
@@ -58,6 +60,7 @@ from syncer.review import (
     ReviewReplica,
     ReviewRule,
     blocked_master_count,
+    build_preview_rule,
     build_review_rule,
     has_drift,
     is_master_blocked,
@@ -92,14 +95,15 @@ _PROGRESS_INTERVAL_S = 0.05
 # Paths shown inline in the delete confirm before deferring to its details pane.
 _DELETE_PREVIEW_LINES = 15
 
+# The tree's first column: opening width, and the floor it can't be dragged
+# below (collapsed, the names vanish while the tick boxes stay).
+_NAME_COLUMN_WIDTH = 320
+_MIN_NAME_COLUMN_WIDTH = 160
+
 
 def _tally_text(counts: dict[str, int]) -> str:
     bits = [f"{counts[bucket]} {words}" for bucket, words in _TALLY_WORDING if counts[bucket]]
     return ", ".join(bits) if bits else "in sync"
-
-
-def _master_label(node: ReviewMaster) -> str:
-    return f"{node.landing_path}  ({node.master.type})"
 
 
 def _make_inert(item: QTreeWidgetItem) -> None:
@@ -110,6 +114,12 @@ def _make_inert(item: QTreeWidgetItem) -> None:
     item.setFlags(item.flags() & ~Qt.ItemIsUserCheckable)
     for column in (0, 1):
         item.setForeground(column, QBrush(_GREY))
+
+
+def _inert_item(parent, name: str, change: str = "", action: str = "") -> QTreeWidgetItem:
+    item = QTreeWidgetItem(parent, [name, change, action])
+    _make_inert(item)
+    return item
 
 
 class CheckWorker(QThread):
@@ -148,6 +158,32 @@ class CheckWorker(QThread):
             collisions=self.collisions,
         )
         self.check_finished.emit(result, self._cancelled)
+
+
+class PreviewWorker(QThread):
+    """Walks one rule's masters by name off the UI thread, so selecting a rule
+    with a large master can't freeze the window (no hashing, no replica read)."""
+
+    # (SyncRule, MasterLayout) — the rule rides along so the receiver can tell
+    # whether it was edited or deselected while the walk ran.
+    preview_ready = Signal(object, object)
+    # (SyncRule, message)
+    preview_failed = Signal(object, str)
+
+    def __init__(self, rule: SyncRule, parent=None):
+        super().__init__(parent)
+        self.rule = rule
+
+    def run(self) -> None:
+        try:
+            layout = scan_master_layout(self.rule.masters)
+        except Exception as exc:
+            # A bug, not a user-facing failure — but an exception escaping a
+            # thread is only printed, and a frozen build has no console, so the
+            # tree would sit on "Scanning masters…" forever.
+            self.preview_failed.emit(self.rule, f"Couldn't scan the masters: {exc!r}")
+        else:
+            self.preview_ready.emit(self.rule, layout)
 
 
 class ReviewPane(QWidget):
@@ -195,12 +231,14 @@ class ReviewPane(QWidget):
         app = QCoreApplication.instance()
         if app is not None:
             # A QThread destroyed mid-run aborts the process; stop it first.
-            app.aboutToQuit.connect(self._stop_worker)
+            app.aboutToQuit.connect(self._stop_workers)
 
         self.rule_list = QListWidget()
         self.rule_list.setMaximumWidth(360)
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Replica / folder / file", "Change", ""])
+        self.tree.setColumnWidth(0, _NAME_COLUMN_WIDTH)
+        self.tree.header().sectionResized.connect(self._clamp_name_column)
         self.tree.itemChanged.connect(self._on_item_changed)
         self.tree.itemClicked.connect(self._on_item_clicked)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -336,10 +374,17 @@ class ReviewPane(QWidget):
             self._check_cancelled = True
         self._pending_check_ids.clear()
 
-    def _stop_worker(self) -> None:
+    def _stop_workers(self) -> None:
         if self._worker is not None:
             self._worker.cancel()
             self._worker.wait()
+        # Preview walks can't be cancelled, only waited out.
+        for worker in self.findChildren(PreviewWorker):
+            worker.wait()
+
+    def _clamp_name_column(self, index: int, _old: int, new: int) -> None:
+        if index == 0 and new < _MIN_NAME_COLUMN_WIDTH:
+            self.tree.setColumnWidth(0, _MIN_NAME_COLUMN_WIDTH)
 
     def _set_checking(self, checking: bool) -> None:
         """The one place the Check/Cancel buttons and `checkingChanged` change,
@@ -477,19 +522,61 @@ class ReviewPane(QWidget):
     # -- right pane --------------------------------------------------------
 
     def _show_rule(self, rule_id: str) -> None:
+        if not self._rules_by_id[rule_id].replicas:
+            self._show_note("No replicas yet")
+            return
         review_rule = self._review.get(rule_id)
-        unlocked = self._unlocked[rule_id]
+        if review_rule is None:
+            self._show_unchecked(rule_id)
+            return
+        self._populate_tree(review_rule, self._unlocked[rule_id])
+        self._apply_selection_to_tree(self._selected[rule_id])
+        self._expand_drifted()
+        self._refresh_bar()
+
+    def _populate_tree(
+        self, review_rule: ReviewRule, unlocked: frozenset[str], preview: bool = False
+    ) -> None:
         with QSignalBlocker(self.tree):
             self.tree.clear()
-            if review_rule is not None:
-                # Built from the visible replicas, so a blocked master's hidden
-                # files never feed a replica's toggle/tick state or expansion.
-                for replica in review_rule.replicas:
-                    self._build_item(self.tree, visible_replica(replica, unlocked), unlocked)
-        if review_rule is not None:
-            self._apply_selection_to_tree(self._selected[rule_id])
-            self._expand_drifted()
+            # Built from the visible replicas, so a blocked master's hidden
+            # files never feed a replica's toggle/tick state or expansion.
+            for replica in review_rule.replicas:
+                self._build_item(self.tree, visible_replica(replica, unlocked), unlocked, preview)
+
+    def _show_note(self, text: str) -> None:
+        with QSignalBlocker(self.tree):
+            self.tree.clear()
+            _inert_item(self.tree, text)
         self._refresh_bar()
+
+    def _show_unchecked(self, rule_id: str) -> None:
+        """A rule with no check result yet (or whose result an edit or reload
+        discarded): shows what each replica should hold per the masters, from a
+        names-only walk on a worker thread. Checks stay on-demand."""
+        self._show_note("Scanning masters…")
+        # Parented to the pane, which keeps it alive until deleteLater.
+        worker = PreviewWorker(self._rules_by_id[rule_id], self)
+        worker.preview_ready.connect(self._on_preview_ready)
+        worker.preview_failed.connect(self._on_preview_failed)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _preview_is_stale(self, rule: SyncRule) -> bool:
+        # The user moved on, or the rule changed, while it walked — or a check
+        # landed first, and its tree is the truth.
+        return self._rules_by_id.get(self._current_rule_id) != rule or rule.id in self._review
+
+    def _on_preview_failed(self, rule: SyncRule, message: str) -> None:
+        if not self._preview_is_stale(rule):
+            self._show_note(message)
+
+    def _on_preview_ready(self, rule: SyncRule, layout: MasterLayout) -> None:
+        if self._preview_is_stale(rule):
+            return
+        preview = build_preview_rule(rule, layout, self._namespace_collisions)
+        self._populate_tree(preview, frozenset(), preview=True)
+        self.tree.expandToDepth(0)
 
     def _collision_banner(self, rule_id: str, collision: NamespaceCollision) -> str:
         others = other_rule_names(collision, rule_id, self._rules_by_id)
@@ -498,8 +585,26 @@ class ReviewPane(QWidget):
             "stop sharing this replica to fix."
         )
 
-    def _build_item(self, parent, node, unlocked: frozenset[str]) -> QTreeWidgetItem:
-        if isinstance(node, ReviewLeaf):
+    def _build_item(
+        self, parent, node, unlocked: frozenset[str], preview: bool = False
+    ) -> QTreeWidgetItem:
+        """`preview` draws the pre-check tree: replicas read "Not checked", and
+        nothing is tickable or unlockable until a check runs."""
+        if isinstance(node, ReviewMaster) and is_master_blocked(node, unlocked):
+            # Banner-only: visible_replica already dropped its children.
+            if node.collision is not None:
+                change, action = self._collision_banner(self._current_rule_id, node.collision), ""
+            else:
+                change = "Master is missing — ordinary sync is blocked for this namespace."
+                action = "" if preview else "Unlock →"
+            item = _inert_item(parent, node.landing_path, change, action)
+        elif isinstance(node, ReviewMaster) and node.is_file:
+            # A file master has no folder in the replica, so its one file
+            # stands in for it, like any other leaf.
+            if node.file_leaf is not None:
+                return self._build_item(parent, node.file_leaf, unlocked, preview)
+            item = _inert_item(parent, node.landing_path)
+        elif isinstance(node, ReviewLeaf):
             item = QTreeWidgetItem(parent, [node.name, node.label, ""])
             if node.checkable:
                 item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
@@ -507,28 +612,24 @@ class ReviewPane(QWidget):
                 _make_inert(item)
                 if node.resolvable:
                     item.setText(2, "Resolve →")
-        elif isinstance(node, ReviewMaster) and is_master_blocked(node, unlocked):
-            # Banner-only: visible_replica already dropped its children.
-            if node.collision is not None:
-                change, action = self._collision_banner(self._current_rule_id, node.collision), ""
-            else:
-                change = "Master is missing — ordinary sync is blocked for this namespace."
-                action = "Unlock →"
-            item = QTreeWidgetItem(parent, [_master_label(node), change, action])
-            _make_inert(item)
-        else:  # ReviewReplica, unblocked ReviewMaster, or ReviewFolder
+        else:  # ReviewReplica, unblocked dir ReviewMaster, or ReviewFolder
             if isinstance(node, ReviewReplica):
-                item = QTreeWidgetItem(parent, [self._replica_item_label(node), "", ""])
+                item = QTreeWidgetItem(
+                    parent, [self._replica_item_label(node), "Not checked" if preview else "", ""]
+                )
                 item.setToolTip(0, node.replica_path)
             else:
-                label = _master_label(node) if isinstance(node, ReviewMaster) else node.name
+                label = node.landing_path if isinstance(node, ReviewMaster) else node.name
                 item = QTreeWidgetItem(parent, [label, "", ""])
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            if preview:
+                item.setFlags(item.flags() & ~Qt.ItemIsUserCheckable)
+            else:
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             bold = item.font(0)
             bold.setWeight(QFont.Bold)
             item.setFont(0, bold)
             for child in node.children:
-                self._build_item(item, child, unlocked)
+                self._build_item(item, child, unlocked, preview)
         item.setData(0, ROLE_NODE, node)
         return item
 
@@ -619,7 +720,8 @@ class ReviewPane(QWidget):
     # -- conflict resolution (issue #7) -------------------------------------
 
     def _on_item_clicked(self, item: QTreeWidgetItem, column: int) -> None:
-        if column != 2 or self._current_rule_id is None:
+        # A pre-check preview offers no actions, however its rows look.
+        if column != 2 or self._current_review() is None:
             return
         node = item.data(0, ROLE_NODE)
         if isinstance(node, ReviewLeaf) and node.resolvable:

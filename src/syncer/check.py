@@ -428,6 +428,24 @@ def _scan_masters(masters: list[Master]) -> tuple[_Side, list[MasterStatus]]:
 
 
 @dataclass(frozen=True)
+class MasterLayout:
+    """What a rule's masters would put in each of its replicas, by name only."""
+
+    files: list[str]  # namespaced POSIX rel_paths, as a replica would hold them
+    statuses: list[MasterStatus]
+
+
+def scan_master_layout(masters: list[Master]) -> MasterLayout:
+    """The files `masters` contribute to a replica, with no hashing and no
+    replica read — the cheap walk the review tree previews from before any
+    check has run. Files only: folders follow from their paths.
+    """
+    side, statuses = _scan_masters(masters)
+    files = sorted(side.entries[key].rel_path for key in _comparable_keys(side))
+    return MasterLayout(files=files, statuses=statuses)
+
+
+@dataclass(frozen=True)
 class _ReplicaPlan:
     """Everything one replica's comparison needs, enumerated up front so the
     file total is known before any categorising starts.

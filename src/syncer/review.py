@@ -19,6 +19,7 @@ from typing import NamedTuple
 from syncer.check import (
     CheckResult,
     FileChange,
+    MasterLayout,
     MasterStatus,
     NamespaceCollision,
     ReplicaCheckResult,
@@ -26,9 +27,11 @@ from syncer.check import (
 )
 from syncer.config import (
     Master,
+    SyncRule,
     master_basename,
     master_basename_key,
     masters_by_basename_key,
+    normalize_replica_path,
     split_landing_path,
 )
 
@@ -45,6 +48,9 @@ CATEGORY_BUCKET: dict[str, str] = {
     "replica_only": "context",
     "unreadable": "context",
     "kept": "context",
+    # Not a check() category: the placeholder a pre-check preview's files carry
+    # (build_preview_rule), so they render but can never be ticked or synced.
+    "not_checked": "context",
 }
 
 # Plain-text labels only — no glyphs (spec.md §5/§7: "the user does not want
@@ -61,6 +67,7 @@ CATEGORY_LABEL: dict[str, str] = {
     "replica_only": "Only in the replica",
     "unreadable": "Couldn't read this file",
     "kept": "Kept replica's version",
+    "not_checked": "",
 }
 
 BUCKETS = ("safe", "delete", "conflict", "context")
@@ -151,6 +158,23 @@ class ReviewMaster:
     @property
     def landing_path(self) -> str:
         return master_basename(self.master.path)
+
+    @property
+    def is_file(self) -> bool:
+        """A file-type master: no folder exists for it in the replica, so a
+        view draws it as its one leaf rather than as an expandable node."""
+        return self.master.type == "file"
+
+    @property
+    def file_leaf(self) -> ReviewLeaf | None:
+        """The one leaf a file-type master lands, for a view to draw in place
+        of the master node; None for a dir master, and for a blocked file
+        master (its children were never built or were cleared — see
+        `visible_replica`)."""
+        if self.is_file and self.children:
+            [leaf] = self.children
+            return leaf
+        return None
 
     @property
     def unlockable(self) -> bool:
@@ -407,6 +431,51 @@ def blocked_master_count(rule: ReviewRule, unlocked: frozenset[str] = frozenset(
         is_master_blocked(master, unlocked)
         for replica in rule.replicas
         for master in replica.children
+    )
+
+
+def build_preview_rule(
+    rule: SyncRule, layout: MasterLayout, collisions: list[NamespaceCollision] | None = None
+) -> ReviewRule:
+    """What each replica should contain per the masters, before any check has
+    run (`scan_master_layout`'s names, nothing read from the replicas) — built
+    through `build_review_rule` so namespacing and per-master blocking match a
+    real check's tree exactly.
+
+    Every file is a `not_checked` context leaf: it renders but is never
+    checkable, resolvable or part of a tally, so nothing in a preview can reach
+    sync(). The FileChange's presence flags are placeholders — a preview knows
+    nothing about the replica — and only `rel_path`/`category` mean anything.
+    """
+    files = [
+        FileChange(
+            rel_path=rel_path,
+            category="not_checked",
+            master_present=True,
+            replica_present=False,
+            baseline_present=False,
+        )
+        for rel_path in layout.files
+    ]
+    return build_review_rule(
+        CheckResult(
+            rule_id=rule.id,
+            rule_name=rule.name,
+            masters=layout.statuses,
+            replicas=[
+                # replica_exists is claimed True: not knowing is not "missing".
+                # Normalised like check()'s, so collisions (keyed the same
+                # way) match and the replica rows read the same.
+                ReplicaCheckResult(
+                    replica_path=normalize_replica_path(replica),
+                    replica_exists=True,
+                    has_baseline=False,
+                    files=files,
+                )
+                for replica in rule.replicas
+            ],
+        ),
+        collisions=collisions,
     )
 
 

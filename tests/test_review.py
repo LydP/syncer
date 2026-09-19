@@ -1,7 +1,14 @@
 import pytest
 
-from syncer.check import CheckResult, FileChange, MasterStatus, NamespaceCollision, ReplicaCheckResult
-from syncer.config import Master
+from syncer.check import (
+    CheckResult,
+    FileChange,
+    MasterLayout,
+    MasterStatus,
+    NamespaceCollision,
+    ReplicaCheckResult,
+)
+from syncer.config import Master, SyncRule, normalize_replica_path
 from syncer.review import (
     CATEGORY_BUCKET,
     CATEGORY_LABEL,
@@ -9,8 +16,10 @@ from syncer.review import (
     ReviewFolder,
     ReviewMaster,
     blocked_master_count,
+    build_preview_rule,
     build_review_rule,
     is_master_blocked,
+    iter_leaves,
     node_state,
     resolve_selection,
     rule_tally,
@@ -121,6 +130,120 @@ def test_a_file_type_master_lands_its_one_file_directly_under_the_master_node():
     assert master.landing_path == "resume.docx"
     [leaf] = master.children
     assert leaf.rel_path == "resume.docx"
+
+
+def test_a_file_type_master_exposes_its_one_file_as_a_flat_leaf_and_a_dir_master_does_not():
+    rep = _replica_result(REP, [_change("skills/a.txt", "new"), _change("resume.docx", "changed")])
+    rule = _rule_for(
+        [rep],
+        masters=(
+            MasterStatus(master=DIR_MASTER, missing=False),
+            MasterStatus(master=FILE_MASTER, missing=False),
+        ),
+    )
+
+    [replica] = rule.replicas
+    [dir_master, file_master] = replica.children
+    assert not dir_master.is_file
+    assert dir_master.file_leaf is None
+    assert file_master.is_file
+    assert file_master.file_leaf.rel_path == "resume.docx"
+    assert file_master.file_leaf.checkable
+
+
+def test_a_blocked_file_type_master_has_no_leaf_to_show_but_is_still_a_file_master():
+    rep = _replica_result(REP, [_change("resume.docx", "changed")])
+    statuses = (MasterStatus(master=FILE_MASTER, missing=True),)
+    collision = NamespaceCollision(replica_path=REP, landing_path="resume.docx", rule_ids=["r1", "r2"])
+    missing = _rule_for([rep], masters=statuses)
+    collided = _rule_for(
+        [rep], masters=(MasterStatus(master=FILE_MASTER, missing=False),), collisions=[collision]
+    )
+
+    [missing_master] = visible_replica(missing.replicas[0], frozenset()).children
+    [collided_master] = visible_replica(collided.replicas[0], frozenset()).children
+    for blocked in (missing_master, collided_master):
+        assert blocked.is_file
+        assert blocked.file_leaf is None
+        assert is_master_blocked(blocked, frozenset())
+
+
+def _preview(replicas, masters=(DIR_MASTER,), files=(), missing=(), collisions=()):
+    rule = SyncRule(id="r1", name="Rule 1", masters=list(masters), replicas=list(replicas))
+    layout = MasterLayout(
+        files=list(files),
+        statuses=[MasterStatus(master=m, missing=m in missing) for m in masters],
+    )
+    return build_preview_rule(rule, layout, collisions=collisions)
+
+
+def test_preview_shows_every_replica_with_the_masters_real_layout():
+    other = "c:\\other"
+    rule = _preview(
+        [REP, other],
+        masters=(DIR_MASTER, FILE_MASTER),
+        files=["resume.docx", "skills/a.txt", "skills/sub/b.txt"],
+    )
+
+    assert [r.replica_path for r in rule.replicas] == [REP, other]
+    for replica in rule.replicas:
+        [dir_master, file_master] = replica.children
+        [a_leaf, sub] = dir_master.children
+        assert (a_leaf.rel_path, sub.name) == ("skills/a.txt", "sub")
+        assert [leaf.rel_path for leaf in sub.children] == ["skills/sub/b.txt"]
+        assert file_master.file_leaf.rel_path == "resume.docx"
+
+
+def test_a_preview_has_nothing_to_tick_resolve_or_sync():
+    rule = _preview([REP], masters=(DIR_MASTER, FILE_MASTER), files=["resume.docx", "skills/a.txt"])
+    [replica] = rule.replicas
+    leaves = list(iter_leaves([replica]))
+
+    assert len(leaves) == 2
+    assert not any(leaf.checkable or leaf.resolvable for leaf in leaves)
+    assert {leaf.label for leaf in leaves} == {""}
+    everything = frozenset(leaf.key for leaf in leaves)
+    assert resolve_selection(rule, everything) == {}
+    assert sync_all_safe_changes(rule) == {}
+    assert rule_tally(rule) == {"safe": 0, "delete": 0, "conflict": 0, "context": 2}
+
+
+def test_a_preview_flags_a_missing_master_as_blocked_without_touching_the_others():
+    rule = _preview(
+        [REP], masters=(DIR_MASTER, FILE_MASTER), files=["resume.docx"], missing=(DIR_MASTER,)
+    )
+
+    [dir_master, file_master] = rule.replicas[0].children
+    assert dir_master.missing and is_master_blocked(dir_master, frozenset())
+    assert not is_master_blocked(file_master, frozenset())
+    assert file_master.file_leaf.rel_path == "resume.docx"
+
+
+def test_a_preview_flags_a_cross_rule_collision_and_lists_no_files_under_it():
+    collision = NamespaceCollision(replica_path=REP, landing_path="skills", rule_ids=["r1", "r2"])
+    rule = _preview([REP], files=["skills/a.txt"], collisions=[collision])
+
+    [master] = rule.replicas[0].children
+    assert master.collision is collision
+    assert master.children == []
+
+
+def test_a_preview_matches_a_collision_on_a_replica_path_written_in_other_casing():
+    written = "C:/Rep"
+    collision = NamespaceCollision(
+        replica_path=normalize_replica_path(written), landing_path="skills", rule_ids=["r1", "r2"]
+    )
+    rule = _preview([written], files=["skills/a.txt"], collisions=[collision])
+
+    [replica] = rule.replicas
+    assert replica.replica_path == normalize_replica_path(written)
+    [master] = replica.children
+    assert master.collision is collision
+    assert master.children == []
+
+
+def test_a_preview_of_a_rule_with_no_replicas_has_no_replica_rows():
+    assert _preview([], files=["skills/a.txt"]).replicas == []
 
 
 def test_each_master_gets_its_own_top_level_branch_under_the_replica():

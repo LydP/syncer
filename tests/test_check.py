@@ -10,6 +10,7 @@ from syncer.check import (
     find_namespace_collisions,
     hash_file,
     other_rule_names,
+    scan_master_layout,
 )
 from syncer.config import Master, SyncRule, normalize_replica_path
 
@@ -733,6 +734,39 @@ def test_present_master_does_not_set_master_missing_flag(master_and_replica):
     result = check(_rule(master, [replica]))
 
     assert result.masters[0].missing is False
+
+
+def test_master_layout_lists_each_masters_files_namespaced_as_a_replica_would_hold_them(tmp_path):
+    skills = tmp_path / "skills"
+    (skills / "sub").mkdir(parents=True)
+    (skills / "a.txt").write_text("a")
+    (skills / "sub" / "b.txt").write_text("b")
+    (skills / ".git").mkdir()
+    (skills / ".git" / "config").write_text("ignored")
+    resume = tmp_path / "resume.docx"
+    resume.write_text("r")
+
+    layout = scan_master_layout(
+        [Master(path=str(skills), type="dir"), Master(path=str(resume), type="file")]
+    )
+
+    assert sorted(layout.files) == ["resume.docx", "skills/a.txt", "skills/sub/b.txt"]
+    assert [status.missing for status in layout.statuses] == [False, False]
+
+
+def test_master_layout_flags_a_missing_master_and_still_lists_the_others(tmp_path):
+    present = tmp_path / "present"
+    present.mkdir()
+    (present / "a.txt").write_text("a")
+    gone = Master(path=str(tmp_path / "gone"), type="dir")
+
+    layout = scan_master_layout([gone, Master(path=str(present), type="dir")])
+
+    assert layout.files == ["present/a.txt"]
+    assert [(s.master, s.missing) for s in layout.statuses] == [
+        (gone, True),
+        (Master(path=str(present), type="dir"), False),
+    ]
 
 
 def test_pyc_files_are_ignored(master_and_replica):
