@@ -12,6 +12,10 @@ _Avoid_: source, original, home copy
 A destination path that receives one or more masters' content, kept in sync one-way from those masters. A folder-type master lands under a subfolder of the replica named for the master's own basename (so a rule's several masters don't collide); a file-type master lands directly at the replica path plus its filename. A replica path may be listed by more than one sync rule.
 _Avoid_: destination, mirror, target, copy
 
+**Replica name**:
+An optional, human-chosen label for a replica path, shown in place of the path wherever the replica appears (the path stays reachable). Belongs to the path itself, not to a rule: every rule that lists the replica shows the same name. Unique across all replicas, ignoring case; a replica with no name is shown by its path.
+_Avoid_: alias, nickname, label
+
 **Sync rule**:
 A set of masters paired with a set of replicas: every master in the rule is kept in sync to every replica in the rule. The unit of configuration. Rules are independent of each other, and both a master and a replica may belong to more than one rule (e.g. a shared "baseline skills" master, or a shared project folder as replica, can each be reused by more than one rule). "One rule per project" is just what a rule looks like when its owner chooses not to split its masters across rules — not a distinct mechanic. A rule must have at least one master to exist, but may be saved with no replicas yet, so it can be built out before it has anywhere to sync to.
 _Avoid_: mapping, pair, job
@@ -39,8 +43,12 @@ The case where both the master and a replica changed since the last sync but end
 **Changed on both sides**:
 The conflict where both the master and a replica were edited since the last sync and no longer match. Distinct from divergence (where only the replica changed) — the tool flags it and refuses to overwrite silently.
 
+**No sync history**:
+The state where a file differs between master and replica and the tool has no record of a previous sync for it — typically the first check of a replica that already holds hand-copied files. The two sides can be compared, but there is no way to tell which one changed, so it is a conflict: resolved per file or in bulk from the conflict dialog, never part of "sync all safe changes". Shown to the user as "Differs from master (no sync history)".
+_Avoid_: no baseline (internal category name only), can't compare (the sides *can* be compared — what's unknown is which one changed)
+
 **Conflict**:
-A drift the tool cannot apply on its own: divergence, changed on both sides, or a no-baseline mismatch. Requires the user to resolve it; never touched by "sync all safe changes."
+A drift the tool cannot apply on its own: divergence, changed on both sides, or a file with no sync history. Requires the user to resolve it; never touched by "sync all safe changes."
 _Avoid_: divergence (only one of the three conflict cases), cross-rule namespace collision (a structural config fact, not a per-file drift — there's nothing to resolve by content, only by editing config)
 
 **Conflict queue**:
