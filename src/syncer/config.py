@@ -35,6 +35,14 @@ class ConfigClobberError(SyncerError):
     pass
 
 
+def native_path(path: str) -> str:
+    """`path` with `/` turned into `\\` — the stored form, so Qt's `/`-form
+    paths and typed `\\`-form ones never mix. Casing, a UNC prefix and a
+    trailing separator stay as entered, unlike the lossy
+    `normalize_replica_path` dedupe key."""
+    return path.replace("/", os.sep)
+
+
 def normalize_replica_path(path: str) -> str:
     return os.path.normcase(os.path.normpath(os.path.abspath(path)))
 
@@ -249,7 +257,7 @@ def _parse_master(raw_master: object) -> Master:
         raise ConfigError(
             f"master key 'type' must be one of {MASTER_TYPES}, got {master_type!r}"
         )
-    return Master(path=_require_str(raw_master, "path"), type=master_type)
+    return Master(path=native_path(_require_str(raw_master, "path")), type=master_type)
 
 
 def _parse_rule(raw_rule: object) -> SyncRule:
@@ -262,7 +270,7 @@ def _parse_rule(raw_rule: object) -> SyncRule:
         id=_require_str(raw_rule, "id"),
         name=_require_str(raw_rule, "name"),
         masters=[_parse_master(raw_master) for raw_master in raw_masters],
-        replicas=_require_str_list(raw_rule, "replicas"),
+        replicas=[native_path(r) for r in _require_str_list(raw_rule, "replicas")],
         ignore=_require_str_list(raw_rule, "ignore"),
     )
 

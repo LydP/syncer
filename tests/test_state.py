@@ -370,6 +370,25 @@ def test_reconcile_with_config_drops_rules_and_replicas_no_longer_configured():
     )
 
 
+def test_reconcile_with_config_keeps_history_for_a_slash_form_replica_path():
+    # An old config.toml may hold the replica as `C:/A/Replica`; its state.json
+    # entry is keyed by the normalized `c:\a\replica` and must survive.
+    config = Config(
+        version=1,
+        rules=[
+            SyncRule(
+                id="rule-1",
+                name="kept rule",
+                masters=[Master(path="m", type="dir")],
+                replicas=["C:/A/Replica"],
+            )
+        ],
+    )
+    state = _state({"rule-1": {r"c:\a\replica": ReplicaState(last_sync="x", files={})}})
+
+    assert reconcile_with_config(state, config) == state
+
+
 def test_reconcile_with_config_purges_a_removed_masters_namespaced_entries():
     config = _config(Master(path="m-kept", type="dir"))
     state = _state(

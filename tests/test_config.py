@@ -19,6 +19,7 @@ from syncer.config import (
     find_name_conflict,
     find_replica_sharers,
     load_config,
+    native_path,
     normalize_replica_path,
     save_config,
     with_rule,
@@ -179,6 +180,19 @@ def test_normalize_replica_path_resolves_relative_segments_and_case():
     assert normalized == r"c:\mystuff\projecta\.claude\skills"
 
 
+@pytest.mark.parametrize(
+    ("entered", "stored"),
+    [
+        # What QFileDialog and QUrl.toLocalFile() hand back.
+        ("C:/MyStuff/ProjectA/.claude/skills", r"C:\MyStuff\ProjectA\.claude\skills"),
+        (r"C:\MyStuff/ProjectA\skills", r"C:\MyStuff\ProjectA\skills"),
+        ("//Server/Share/Skills", r"\\Server\Share\Skills"),
+    ],
+)
+def test_native_path_unifies_separators_and_keeps_the_rest(entered, stored):
+    assert native_path(entered) == stored
+
+
 def test_load_config_parses_version_and_empty_rules(layout):
     _write_config(layout.config_path)
 
@@ -224,6 +238,26 @@ def test_load_config_parses_a_rule_with_several_masters(layout):
         Master(path=r"C:\MyStuff\skills\wayfinder", type="dir"),
         Master(path=r"C:\MyStuff\resume.docx", type="file"),
     ]
+
+
+def test_load_config_unifies_slash_form_master_and_replica_paths(layout):
+    # A config written before separators were normalized on entry.
+    _write_config(
+        layout.config_path,
+        _rule_toml(
+            "11111111-1111-4111-8111-111111111111",
+            [("C:/MyStuff/skills/wayfinder", "dir"), (r"C:\MyStuff/resume.docx", "file")],
+            replicas=["C:/ProjectA/.claude/skills", r"C:\ProjectB\.claude/skills"],
+        ),
+    )
+
+    rule = load_config(layout.config_path).rules[0]
+
+    assert rule.masters == [
+        Master(path=r"C:\MyStuff\skills\wayfinder", type="dir"),
+        Master(path=r"C:\MyStuff\resume.docx", type="file"),
+    ]
+    assert rule.replicas == [r"C:\ProjectA\.claude\skills", r"C:\ProjectB\.claude\skills"]
 
 
 def test_load_config_allows_the_same_master_path_across_rules(layout):
@@ -352,6 +386,21 @@ def test_save_config_round_trips_through_load_config(layout):
 
     assert layout.config_path.is_file()
     assert load_config(layout.config_path) == config
+
+
+def test_saving_a_loaded_slash_form_config_rewrites_it_in_native_form(layout):
+    _write_config(
+        layout.config_path,
+        _rule_toml(
+            "11111111-1111-4111-8111-111111111111",
+            [("C:/MyStuff/skills/wayfinder", "dir")],
+            replicas=["C:/ProjectA/.claude/skills"],
+        ),
+    )
+
+    save_config(layout.config_path, load_config(layout.config_path), layout.backups_dir)
+
+    assert "/" not in layout.config_path.read_text()
 
 
 def test_save_config_round_trips_a_rule_with_several_masters(layout):

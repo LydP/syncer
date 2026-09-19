@@ -50,6 +50,7 @@ from syncer.config import (
     find_name_conflict,
     find_replica_sharers,
     master_basename_key,
+    native_path,
     normalize_replica_path,
     with_rule,
 )
@@ -182,6 +183,7 @@ class RuleDialog(QDialog):
         path = self._pick_path(master_type, "master")
         if not path:
             return
+        path = native_path(path)
         # Pre-fill only a new rule's name: an edited rule's loaded name is
         # the user's own, though isModified() reports it as untouched.
         if self._existing_rule is None and not self.name_edit.isModified() and not self._masters:
@@ -276,6 +278,8 @@ class RuleDialog(QDialog):
         self._add_replica(path)
 
     def _add_replica(self, path: str) -> None:
+        # The one funnel for typed, dropped and Browse paths.
+        path = native_path(path)
         normalized = normalize_replica_path(path)
         if any(normalize_replica_path(r) == normalized for r in self._replicas):
             return  # already in the list

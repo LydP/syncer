@@ -97,6 +97,21 @@ def test_file_only_in_replica_is_replica_only(master_and_replica):
     assert change.replica_present is True
 
 
+def test_slash_form_replica_path_still_finds_its_baseline(master_and_replica):
+    # An old config.toml may hold the replica with `/` separators; the baseline
+    # is keyed by the normalized path, so the sync history must still be found.
+    master, replica = master_and_replica
+    (master / "a.txt").write_text("hello")
+    (replica / "master" / "a.txt").write_text("hello")
+    baseline = _baseline(replica, {"master/a.txt": _baseline_entry_for(replica / "master" / "a.txt")})
+    (master / "a.txt").write_text("hello world")
+    slash_form_replica = str(replica).replace("\\", "/")
+
+    change = _only_change(check(_rule(master, [slash_form_replica]), baseline=baseline))
+
+    assert change.category == "changed"
+
+
 def test_master_edited_since_last_sync_is_changed(master_and_replica):
     master, replica = master_and_replica
     (master / "a.txt").write_text("hello")
