@@ -246,6 +246,9 @@ class ReviewPane(QWidget):
         layout.addWidget(actions)
 
         self.rule_list.currentRowChanged.connect(self._on_rule_row_changed)
+        # Populate from the initial rules: a launch with an existing config.toml
+        # never goes through apply_config, so the pane seeds itself here.
+        self._repopulate_and_select(None, set())
 
     def _current_review(self) -> tuple[str, ReviewRule] | None:
         rule_id = self._current_rule_id
@@ -308,20 +311,7 @@ class ReviewPane(QWidget):
         )
         self._pending_check_ids = [k for k in self._pending_check_ids if k in self._rules_by_id]
 
-        previous_rule_id = self._current_rule_id
-        with QSignalBlocker(self.rule_list):
-            self.rule_list.clear()  # empties the list, so the refresh recreates rows
-            self._refresh_rule_list()
-        ids = list(self._rules_by_id)  # also the row order
-        if not ids:
-            self._on_rule_row_changed(-1)
-            return
-        rule_id = previous_rule_id if previous_rule_id in self._rules_by_id else ids[0]
-        if rule_id == previous_rule_id and rule_id in unchanged:
-            with QSignalBlocker(self.rule_list):
-                self.rule_list.setCurrentRow(ids.index(rule_id))  # tree is still accurate
-        else:
-            self.rule_list.setCurrentRow(ids.index(rule_id))  # fires _on_rule_row_changed -> _show_rule
+        self._repopulate_and_select(self._current_rule_id, unchanged)
 
     def _queue_check(self, rule_id: str) -> None:
         """Adds one rule to the check queue without dropping rules already
@@ -405,9 +395,7 @@ class ReviewPane(QWidget):
         # Equal to the pane's for this rule (checked above).
         self._review[result.rule_id] = build_review_rule(result, collisions=worker.collisions)
         self._refresh_rule_list()
-        if self.rule_list.currentRow() < 0 and self.rule_list.count():
-            self.rule_list.setCurrentRow(0)  # fires _on_rule_row_changed -> _show_rule
-        elif result.rule_id == self._current_rule_id:
+        if result.rule_id == self._current_rule_id:
             self._show_rule(result.rule_id)
 
     def _on_worker_finished(self) -> None:
@@ -434,6 +422,29 @@ class ReviewPane(QWidget):
             n_rep = len(sync_rule.replicas)
             status = f"{n_rep} replica{'s' if n_rep != 1 else ''}  ·  {drift}"
         return f"{sync_rule.name}\n   {masters}\n   {status}"
+
+    def _repopulate_and_select(self, preferred_rule_id: str | None, unchanged: set[str]) -> None:
+        """Rebuilds the left pane's rows and lands on a row: `preferred_rule_id`
+        if it survived the rule set changing, else the first one. The single
+        place that decides which row is current afterwards — `__init__` and
+        `apply_config` both come through here, so a pane is never left
+        unpopulated or without a selection. `unchanged` names the rules whose
+        cached review is still accurate, so reselecting one can skip the
+        rebuild of the right pane.
+        """
+        with QSignalBlocker(self.rule_list):
+            self.rule_list.clear()  # empties the list, so the refresh recreates rows
+            self._refresh_rule_list()
+        ids = list(self._rules_by_id)  # also the row order
+        if not ids:
+            self._on_rule_row_changed(-1)
+            return
+        rule_id = preferred_rule_id if preferred_rule_id in self._rules_by_id else ids[0]
+        if rule_id == preferred_rule_id and rule_id in unchanged:
+            with QSignalBlocker(self.rule_list):
+                self.rule_list.setCurrentRow(ids.index(rule_id))  # tree is still accurate
+        else:
+            self.rule_list.setCurrentRow(ids.index(rule_id))  # fires _on_rule_row_changed -> _show_rule
 
     def _refresh_rule_list(self) -> None:
         """Rewrites row texts in place (rows are created once, lazily) so the
