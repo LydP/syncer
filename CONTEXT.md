@@ -16,6 +16,10 @@ _Avoid_: destination, mirror, target, copy
 An optional, human-chosen label for a replica path, shown in place of the path wherever the replica appears (the path stays reachable). Belongs to the path itself, not to a rule: every rule that lists the replica shows the same name. Unique across all replicas, ignoring case; a replica with no name is shown by its path.
 _Avoid_: alias, nickname, label
 
+**Landing path**:
+Where one master's content comes to rest inside a replica, as a path relative to the replica root: a folder-type master's `<basename>/` subfolder and everything beneath it, or a file-type master's bare filename. Computed from configuration alone, with no filesystem read. It is the key every per-file comparison is made against, so a replica's drift report doesn't care which master contributed a given file. Two masters landing at the same path inside a shared replica is a **Cross-rule namespace collision**; within a single rule, config validation makes that impossible.
+_Avoid_: namespace (fine informally, but **Cross-rule namespace collision** owns the word), subfolder (only true for a folder-type master), prefix
+
 **Sync rule**:
 A set of masters paired with a set of replicas: every master in the rule is kept in sync to every replica in the rule. The unit of configuration. Rules are independent of each other, and both a master and a replica may belong to more than one rule (e.g. a shared "baseline skills" master, or a shared project folder as replica, can each be reused by more than one rule). "One rule per project" is just what a rule looks like when its owner chooses not to split its masters across rules — not a distinct mechanic. A rule must have at least one master to exist, but may be saved with no replicas yet, so it can be built out before it has anywhere to sync to.
 _Avoid_: mapping, pair, job
@@ -72,6 +76,10 @@ _Avoid_: resolved (covers all three resolution outcomes, not just this one), ign
 **Master missing**:
 The state where one of a rule's masters — the whole directory, or the one file for a file-type master — doesn't exist or can't be read at check time, as distinct from individual files having been deleted from a master that's still there. Evaluated per master: blocks ordinary sync for that master's namespace only, across every replica in the rule, until the user explicitly unlocks it, so a bad path or an unmounted drive can't masquerade as "this master deleted everything" — while the rule's other masters keep syncing normally.
 _Avoid_: master_deleted (the per-file category for content removed while the rule's master root is still present)
+
+**Session**:
+One run of the app, together with the live working set it holds in memory: the loaded sync rules, each rule's most recent check result, which masters the user has unlocked, which files are ticked, and which rules are queued to be checked. None of it is written to disk — it is rebuilt from `config.toml` and `state.json` at each launch, which is what "in-session only" means wherever this glossary uses the phrase (see **Master missing**). Distinct from the last-sync record in `state.json`, which does persist: a session holds that record and writes it back, but the session's own contents end when the window closes.
+_Avoid_: workspace, controller, manager, application state
 
 **App update**:
 Replacing the running Syncer build with a newer released version, started only when the user explicitly asks for it. Concerns the tool itself, never masters or replicas, and must leave the user's own data (configuration, last-sync records, backups, logs) untouched.
