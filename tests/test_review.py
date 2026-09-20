@@ -18,7 +18,6 @@ from syncer.review import (
     blocked_master_count,
     build_preview_rule,
     build_review_rule,
-    is_master_blocked,
     iter_leaves,
     node_state,
     resolve_selection,
@@ -27,7 +26,6 @@ from syncer.review import (
     sync_all_safe_changes,
     tally,
     toggle,
-    visible_replica,
 )
 
 REP = "c:\\rep"
@@ -160,12 +158,12 @@ def test_a_blocked_file_type_master_has_no_leaf_to_show_but_is_still_a_file_mast
         [rep], masters=(MasterStatus(master=FILE_MASTER, missing=False),), collisions=[collision]
     )
 
-    [missing_master] = visible_replica(missing.replicas[0], frozenset()).children
-    [collided_master] = visible_replica(collided.replicas[0], frozenset()).children
+    [missing_master] = missing.replicas[0].children
+    [collided_master] = collided.replicas[0].children
     for blocked in (missing_master, collided_master):
         assert blocked.is_file
         assert blocked.file_leaf is None
-        assert is_master_blocked(blocked, frozenset())
+        assert blocked.blocked
 
 
 def _preview(replicas, masters=(DIR_MASTER,), files=(), missing=(), collisions=()):
@@ -214,8 +212,8 @@ def test_a_preview_flags_a_missing_master_as_blocked_without_touching_the_others
     )
 
     [dir_master, file_master] = rule.replicas[0].children
-    assert dir_master.missing and is_master_blocked(dir_master, frozenset())
-    assert not is_master_blocked(file_master, frozenset())
+    assert dir_master.missing and dir_master.blocked
+    assert not file_master.blocked
     assert file_master.file_leaf.rel_path == "resume.docx"
 
 
@@ -442,11 +440,23 @@ def _two_master_rule(dir_missing):
 
 def test_missing_master_blocks_its_own_namespace_until_explicitly_unlocked():
     rule = _rule(("skills/a.txt", "new"), missing=True)
-    master = _master_node(rule)
 
-    assert master.unlockable is True
-    assert is_master_blocked(master, unlocked=frozenset()) is True
-    assert is_master_blocked(master, unlocked=frozenset({"skills"})) is False
+    assert _master_node(rule).unlockable is True
+    assert _master_node(rule).blocked is True
+    assert _master_node(rule.unlock("skills")).blocked is False
+    # unlock() returns a new rule; a re-check rebuilding the tree therefore
+    # re-blocks structurally, with no unlock state to clear (spec.md §8).
+    assert _master_node(rule).blocked is True
+
+
+def test_unlock_is_offered_only_while_a_liftable_block_is_in_force():
+    missing = _rule(("skills/a.txt", "new"), missing=True)
+    present = _rule(("skills/a.txt", "new"), missing=False)
+
+    assert _master_node(missing).unlock_offered is True
+    # Still `unlockable`, but there is no longer a block to lift.
+    assert _master_node(missing.unlock("skills")).unlock_offered is False
+    assert _master_node(present).unlock_offered is False
 
 
 def test_master_is_never_blocked_when_present_and_not_collided():
@@ -454,7 +464,7 @@ def test_master_is_never_blocked_when_present_and_not_collided():
     master = _master_node(rule)
 
     assert master.unlockable is False
-    assert is_master_blocked(master, unlocked=frozenset()) is False
+    assert master.blocked is False
 
 
 def test_a_missing_masters_files_are_still_built_so_unlocking_reveals_them():
@@ -470,25 +480,49 @@ def test_one_missing_master_does_not_block_a_sibling_master_in_the_same_replica(
     rule = _two_master_rule(dir_missing=True)
 
     [dir_master, file_master] = rule.replicas[0].children
-    assert is_master_blocked(dir_master, unlocked=frozenset()) is True
-    assert is_master_blocked(file_master, unlocked=frozenset()) is False
+    assert dir_master.blocked is True
+    assert file_master.blocked is False
 
 
-def test_visible_replica_clears_a_blocked_masters_children_and_leaves_others_alone():
+def test_visible_children_is_empty_for_a_blocked_master_and_full_for_an_unlocked_one():
     rule = _two_master_rule(dir_missing=True)
 
-    visible = visible_replica(rule.replicas[0], unlocked=frozenset())
+    [dir_master, file_master] = rule.replicas[0].children
+    assert dir_master.visible_children == []
+    assert [leaf.rel_path for leaf in file_master.visible_children] == ["resume.docx"]
 
-    [dir_master, file_master] = visible.children
-    assert dir_master.children == []
-    assert [leaf.rel_path for leaf in file_master.children] == ["resume.docx"]
+    [unlocked_dir_master, _] = rule.unlock("skills").replicas[0].children
+    assert [leaf.rel_path for leaf in unlocked_dir_master.visible_children] == ["skills/a.txt"]
+
+
+def test_unlock_reveals_the_named_master_in_every_replica_of_the_rule():
+    rep1 = _replica_result("c:\\rep1", [_change("skills/a.txt", "new")])
+    rep2 = _replica_result("c:\\rep2", [_change("skills/a.txt", "new")])
+    rule = _rule_for(
+        [rep1, rep2], masters=(MasterStatus(master=DIR_MASTER, missing=True),)
+    )
+
+    unlocked = rule.unlock("skills")
+
+    for replica in unlocked.replicas:
+        [master] = replica.children
+        assert master.blocked is False
+        assert [leaf.rel_path for leaf in master.visible_children] == ["skills/a.txt"]
+
+
+def test_an_unlock_naming_a_different_landing_path_leaves_the_master_blocked():
+    rule = _two_master_rule(dir_missing=True)
+
+    [dir_master, _] = rule.unlock("some-other-master").replicas[0].children
+
+    assert dir_master.blocked is True
 
 
 def test_rule_tally_excludes_a_blocked_masters_leaves():
     rule = _two_master_rule(dir_missing=True)
 
-    assert rule_tally(rule, unlocked=frozenset()) == {"safe": 1, "delete": 0, "conflict": 0, "context": 0}
-    assert rule_tally(rule, unlocked=frozenset({"skills"})) == {
+    assert rule_tally(rule) == {"safe": 1, "delete": 0, "conflict": 0, "context": 0}
+    assert rule_tally(rule.unlock("skills")) == {
         "safe": 2,
         "delete": 0,
         "conflict": 0,
@@ -499,14 +533,14 @@ def test_rule_tally_excludes_a_blocked_masters_leaves():
 def test_blocked_master_count_counts_blocked_namespaces_until_unlocked():
     rule = _two_master_rule(dir_missing=True)
 
-    assert blocked_master_count(rule, unlocked=frozenset()) == 1
-    assert blocked_master_count(rule, unlocked=frozenset({"skills"})) == 0
+    assert blocked_master_count(rule) == 1
+    assert blocked_master_count(rule.unlock("skills")) == 0
 
 
 def test_sync_all_safe_changes_skips_a_blocked_masters_files():
     rule = _two_master_rule(dir_missing=True)
 
-    applied = sync_all_safe_changes(rule, unlocked=frozenset())
+    applied = sync_all_safe_changes(rule)
 
     assert [c.rel_path for c in applied[REP]] == ["resume.docx"]
 
@@ -515,7 +549,7 @@ def test_resolve_selection_drops_a_stale_tick_whose_master_became_blocked():
     rule = _rule(("skills/a.txt", "new"), missing=True)
     selected = _keys("skills/a.txt")
 
-    applied = resolve_selection(rule, selected, unlocked=frozenset())
+    applied = resolve_selection(rule, selected)
 
     assert applied == {}
 
@@ -541,7 +575,8 @@ def test_a_collision_blocks_regardless_of_any_unlock():
     master = _master_node(rule)
 
     assert master.unlockable is False
-    assert is_master_blocked(master, unlocked=frozenset({"skills"})) is True
+    assert master.blocked is True
+    assert _master_node(rule.unlock("skills")).blocked is True
 
 
 def test_a_collision_naming_a_different_rule_does_not_apply():

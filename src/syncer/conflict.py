@@ -23,7 +23,16 @@ from syncer.config import (
     normalize_replica_path,
     replica_abs_path,
 )
-from syncer.review import CONFLICT_CATEGORIES, ReviewLeaf, ReviewNode, ReviewReplica, iter_leaves
+from syncer.review import (
+    CONFLICT_CATEGORIES,
+    ReviewLeaf,
+    ReviewNode,
+    ReviewReplica,
+    # Lives in review.py beside `iter_leaves`/`ReviewLeaf`; re-exported here
+    # because the conflict dialog and its bulk actions are its callers.
+    changes_by_replica,
+    iter_leaves,
+)
 from syncer.state import State, merge_replica_entries, save_state
 
 # Above this, a text file falls back to metadata-only (spec.md §9: "a text
@@ -210,15 +219,6 @@ def conflict_queue(nodes: Iterable[ReviewNode | ReviewReplica]) -> list[ReviewLe
     walks the same order as the tree the user is looking at.
     """
     return [leaf for leaf in iter_leaves(nodes) if leaf.bucket == "conflict"]
-
-
-def changes_by_replica(leaves: Iterable[ReviewLeaf]) -> dict[str, list[FileChange]]:
-    """`{replica_path: [FileChange]}` — the per-replica shape `sync.sync()` and
-    `apply_keep_replica` both take, for a bulk action spanning several replicas."""
-    grouped: dict[str, list[FileChange]] = defaultdict(list)
-    for leaf in leaves:
-        grouped[leaf.replica_path].append(leaf.file_change)
-    return dict(grouped)
 
 
 def summarize_overwrite(changes: list[FileChange]) -> OverwriteSummary:

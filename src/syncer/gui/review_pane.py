@@ -63,14 +63,12 @@ from syncer.review import (
     build_preview_rule,
     build_review_rule,
     has_drift,
-    is_master_blocked,
     node_state,
     resolve_selection,
     rule_tally,
     selection_by_bucket,
     sync_all_safe_changes,
     toggle,
-    visible_replica,
 )
 from syncer.state import State, baseline_for_rule
 from syncer.sync import sync as run_sync
@@ -85,8 +83,12 @@ _TALLY_WORDING = (("safe", "to sync"), ("delete", "to delete"), ("conflict", "co
 
 _GREY = QColor("#9a9a9a")
 
-# The ReviewReplica/ReviewMaster/ReviewFolder/ReviewLeaf a tree item mirrors —
-# from visible_replica, so a blocked master-subfolder's hidden files are absent.
+# The ReviewReplica/ReviewMaster/ReviewFolder/ReviewLeaf a tree item mirrors.
+#
+# Blocking is the model's job throughout this file: a blocked master-subfolder
+# hides its own leaves behind `visible_children` (review.py), so nothing here —
+# tree building, tallies, selection, bulk actions or the conflict queue — needs
+# a blocked gate of its own.
 ROLE_NODE = Qt.UserRole + 1
 
 # Minimum gap between cross-thread progress signals; check() reports per file.
@@ -219,10 +221,6 @@ class ReviewPane(QWidget):
 
         self._review: dict[str, ReviewRule] = {}
         self._selected: defaultdict[str, frozenset[LeafKey]] = defaultdict(frozenset)
-        # rule_id -> the landing_paths the user has unlocked this session
-        # (spec.md §8: per-master-subfolder now, issue #24 — narrowed from a
-        # single rule-wide unlock).
-        self._unlocked: defaultdict[str, frozenset[str]] = defaultdict(frozenset)
         self._current_rule_id: str | None = None
         self._pending_check_ids: list[str] = []
         self._worker: CheckWorker | None = None
@@ -348,9 +346,6 @@ class ReviewPane(QWidget):
         self._selected = defaultdict(
             frozenset, {k: v for k, v in self._selected.items() if k in unchanged}
         )
-        self._unlocked = defaultdict(
-            frozenset, {k: v for k, v in self._unlocked.items() if k in unchanged}
-        )
         self._pending_check_ids = [k for k in self._pending_check_ids if k in self._rules_by_id]
 
         self._repopulate_and_select(self._current_rule_id, unchanged)
@@ -444,8 +439,8 @@ class ReviewPane(QWidget):
             if current_rule is not None and result.rule_id not in self._pending_check_ids:
                 self._pending_check_ids.append(result.rule_id)
             return
-        self._unlocked.pop(result.rule_id, None)  # a re-check re-blocks (spec.md §8)
-        # Equal to the pane's for this rule (checked above).
+        # Equal to the pane's for this rule (checked above). A fresh tree
+        # carries no unlocks, so a re-check re-blocks structurally (spec.md §8).
         self._review[result.rule_id] = build_review_rule(result, collisions=worker.collisions)
         self._refresh_rule_list()
         if result.rule_id == self._current_rule_id:
@@ -467,9 +462,8 @@ class ReviewPane(QWidget):
         if review_rule is None:
             status = "not checked yet"
         else:
-            unlocked = self._unlocked[rule_id]
-            drift = _tally_text(rule_tally(review_rule, unlocked))
-            n_blocked = blocked_master_count(review_rule, unlocked)
+            drift = _tally_text(rule_tally(review_rule))
+            n_blocked = blocked_master_count(review_rule)
             if n_blocked:
                 drift += f", {n_blocked} blocked"
             n_rep = len(sync_rule.replicas)
@@ -529,20 +523,16 @@ class ReviewPane(QWidget):
         if review_rule is None:
             self._show_unchecked(rule_id)
             return
-        self._populate_tree(review_rule, self._unlocked[rule_id])
+        self._populate_tree(review_rule)
         self._apply_selection_to_tree(self._selected[rule_id])
         self._expand_drifted()
         self._refresh_bar()
 
-    def _populate_tree(
-        self, review_rule: ReviewRule, unlocked: frozenset[str], preview: bool = False
-    ) -> None:
+    def _populate_tree(self, review_rule: ReviewRule, preview: bool = False) -> None:
         with QSignalBlocker(self.tree):
             self.tree.clear()
-            # Built from the visible replicas, so a blocked master's hidden
-            # files never feed a replica's toggle/tick state or expansion.
             for replica in review_rule.replicas:
-                self._build_item(self.tree, visible_replica(replica, unlocked), unlocked, preview)
+                self._build_item(self.tree, replica, preview)
 
     def _show_note(self, text: str) -> None:
         with QSignalBlocker(self.tree):
@@ -575,7 +565,7 @@ class ReviewPane(QWidget):
         if self._preview_is_stale(rule):
             return
         preview = build_preview_rule(rule, layout, self._namespace_collisions)
-        self._populate_tree(preview, frozenset(), preview=True)
+        self._populate_tree(preview, preview=True)
         self.tree.expandToDepth(0)
 
     def _collision_banner(self, rule_id: str, collision: NamespaceCollision) -> str:
@@ -585,13 +575,11 @@ class ReviewPane(QWidget):
             "stop sharing this replica to fix."
         )
 
-    def _build_item(
-        self, parent, node, unlocked: frozenset[str], preview: bool = False
-    ) -> QTreeWidgetItem:
+    def _build_item(self, parent, node, preview: bool = False) -> QTreeWidgetItem:
         """`preview` draws the pre-check tree: replicas read "Not checked", and
         nothing is tickable or unlockable until a check runs."""
-        if isinstance(node, ReviewMaster) and is_master_blocked(node, unlocked):
-            # Banner-only: visible_replica already dropped its children.
+        if isinstance(node, ReviewMaster) and node.blocked:
+            # Banner-only: a blocked master's `visible_children` is empty.
             if node.collision is not None:
                 change, action = self._collision_banner(self._current_rule_id, node.collision), ""
             else:
@@ -602,7 +590,7 @@ class ReviewPane(QWidget):
             # A file master has no folder in the replica, so its one file
             # stands in for it, like any other leaf.
             if node.file_leaf is not None:
-                return self._build_item(parent, node.file_leaf, unlocked, preview)
+                return self._build_item(parent, node.file_leaf, preview)
             item = _inert_item(parent, node.landing_path)
         elif isinstance(node, ReviewLeaf):
             item = QTreeWidgetItem(parent, [node.name, node.label, ""])
@@ -628,8 +616,8 @@ class ReviewPane(QWidget):
             bold = item.font(0)
             bold.setWeight(QFont.Bold)
             item.setFont(0, bold)
-            for child in node.children:
-                self._build_item(item, child, unlocked, preview)
+            for child in node.visible_children:
+                self._build_item(item, child, preview)
         item.setData(0, ROLE_NODE, node)
         return item
 
@@ -692,13 +680,8 @@ class ReviewPane(QWidget):
                 button.setEnabled(False)
             return
         rule_id, review_rule = current
-        unlocked = self._unlocked[rule_id]
-        # A blocked master-subfolder already contributes nothing to these —
-        # rule_tally/resolve_selection exclude it (issue #24) — so the
-        # buttons need no separate blocked gate; a still-blocked namespace
-        # just never shows up in the counts they act on.
-        counts = rule_tally(review_rule, unlocked)
-        selection = resolve_selection(review_rule, self._selected[rule_id], unlocked)
+        counts = rule_tally(review_rule)
+        selection = resolve_selection(review_rule, self._selected[rule_id])
         n_selected = sum(map(len, selection.values()))
         self.btn_sync_selected.setText(f"Sync selected ({n_selected})")
         self.btn_sync_selected.setEnabled(n_selected > 0)
@@ -708,7 +691,7 @@ class ReviewPane(QWidget):
         self.btn_resolve.setEnabled(counts["conflict"] > 0)
 
     def _unlock_master(self, rule_id: str, landing_path: str) -> None:
-        self._unlocked[rule_id] |= {landing_path}
+        self._review[rule_id] = self._review[rule_id].unlock(landing_path)
         self._refresh_rule_list()
         self._show_rule(rule_id)
 
@@ -726,26 +709,17 @@ class ReviewPane(QWidget):
         node = item.data(0, ROLE_NODE)
         if isinstance(node, ReviewLeaf) and node.resolvable:
             self._run_conflict_dialog(self._current_rule_id, [node])
-        elif (
-            isinstance(node, ReviewMaster)
-            and node.unlockable
-            and node.landing_path not in self._unlocked[self._current_rule_id]
-        ):
+        elif isinstance(node, ReviewMaster) and node.unlock_offered:
             self._unlock_master(self._current_rule_id, node.landing_path)
 
     def _open_conflict_dialog(self, rule_id: str, replica_path: str | None = None) -> None:
         """Queues every conflict in the rule, or just one replica's when
-        `replica_path` is given. Blocked master-subfolders are pruned first
-        (visible_replica) so a still-missing or collided namespace's
-        conflicts never enter the queue (issue #24)."""
+        `replica_path` is given."""
         review_rule = self._review.get(rule_id)
         if review_rule is None:
             return
-        unlocked = self._unlocked[rule_id]
         nodes = [
-            visible_replica(r, unlocked)
-            for r in review_rule.replicas
-            if replica_path is None or r.replica_path == replica_path
+            r for r in review_rule.replicas if replica_path is None or r.replica_path == replica_path
         ]
         queue = conflict_queue(nodes)
         if queue:
@@ -779,8 +753,6 @@ class ReviewPane(QWidget):
         # Bind the path, not the node: a lambda closing over `node` would pin
         # this whole replica subtree alive for as long as the menu's actions.
         replica_path = node.replica_path
-        # Already a visible_replica (_show_rule), so a blocked master-subfolder's
-        # files never enter a bulk action either.
         by_category = bulk_candidates_by_category([node])
         menu = QMenu(self)
         # Deleted with the menu rather than living on as a child of the pane.
@@ -837,18 +809,15 @@ class ReviewPane(QWidget):
         current = self._current_review()
         if current is not None:
             rule_id, review_rule = current
-            self._apply_changes(
-                rule_id, sync_all_safe_changes(review_rule, self._unlocked[rule_id])
-            )
+            self._apply_changes(rule_id, sync_all_safe_changes(review_rule))
 
     def _sync_selected(self) -> None:
         current = self._current_review()
         if current is None:
             return
         rule_id, review_rule = current
-        unlocked = self._unlocked[rule_id]
         selected = self._selected[rule_id]
-        delete_changes = selection_by_bucket(review_rule, selected, "delete", unlocked)
+        delete_changes = selection_by_bucket(review_rule, selected, "delete")
         if delete_changes:
             lines = [
                 f"{path}: {change.rel_path}"
@@ -873,7 +842,7 @@ class ReviewPane(QWidget):
                 return
         # sync() orders copies before deletions itself (sync.py), so the
         # safe and delete picks need no separate batching here.
-        self._apply_changes(rule_id, resolve_selection(review_rule, selected, unlocked))
+        self._apply_changes(rule_id, resolve_selection(review_rule, selected))
 
     def _apply_changes(self, rule_id: str, applied_changes: dict) -> None:
         if not applied_changes:

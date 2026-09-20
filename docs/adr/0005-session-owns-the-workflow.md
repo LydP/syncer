@@ -8,7 +8,8 @@ accepted
 
 The live working set for one run of the app — a **Session** (see `CONTEXT.md`) — lives in a
 Qt-free `src/syncer/session.py`, not in a `QWidget`. It owns the in-memory `State` and its
-`state_path`/`logs_dir`, every rule's cached review tree, the per-rule unlock and tick selection,
+`state_path`/`logs_dir`, every rule's cached review tree (which since issue #49 carries each
+master's unlock state, so there is no separate unlock set to own), the per-rule tick selection,
 the namespace-collision set, the check queue and its stale-result gate. `gui/` keeps widgets,
 which rule row is current, the `QThread` handles, and every `QMessageBox` and its wording.
 
@@ -20,8 +21,8 @@ Four parts follow from that:
   therefore still happens on the GUI thread.
 - **The interface is coarse, and its queries are bound.** `session.sync_selected(rule_id)` derives
   the changes from the Session's own selection rather than taking them; `session.tree(rule_id)`
-  returns a tree with blocking already resolved rather than a raw `ReviewRule` the caller must
-  remember to pass through `visible_replica`. Callers do not re-derive what the Session knows.
+  returns the rule's current tree rather than making the caller track which of its masters the
+  user has unlocked. Callers do not re-derive what the Session knows.
 - **`ConfigStore` is composed, not absorbed.** It keeps its own concern — the warn-before-clobber
   mtime guard — and the Session calls it.
 - **`app.py` keeps the bootstrap.** The Session is constructed from finished values
@@ -39,10 +40,10 @@ config no longer has. Moving the workflow behind one Qt-free interface is what m
 behaviours reachable from `pytest` at all.
 
 Pulling rather than pushing is what preserves the existing threading model. Today only `check()`
-runs off the GUI thread; the review cache, unlock set and queue are read and written solely from
-GUI-thread slots. A Session that started its own worker would mutate `_review` and `_unlocked`
-off-thread while `check_finished`'s gate read them on it — a race the current design does not
-have. A future reader should not "finish the job" by giving the Session its own threading.
+runs off the GUI thread; the review cache (which since issue #49 carries the unlock state too) and
+the queue are read and written solely from GUI-thread slots. A Session that started its own worker
+would mutate `_review` off-thread while `check_finished`'s gate read it on it — a race the current
+design does not have. A future reader should not "finish the job" by giving the Session its own threading.
 
 `app.py` keeps the bootstrap because ADR 0004 places an app update's success point between the
 config load and the state load (`report_launched`, after `config_store.load()` and before
