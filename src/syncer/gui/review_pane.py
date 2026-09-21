@@ -43,12 +43,11 @@ from syncer.check import (
     MasterLayout,
     NamespaceCollision,
     check,
-    collisions_for_rule,
     other_rule_names,
     scan_master_layout,
 )
 from syncer.config import Config, SyncRule, master_basename, replica_label
-from syncer.gui.conflict_dialog import ConflictDialog, confirm_bulk_overwrite
+from syncer.gui.conflict_dialog import ConflictDialog, confirm_bulk_overwrite, error_detail
 from syncer.review import (
     CATEGORY_LABEL,
     CONFLICT_CATEGORIES,
@@ -58,8 +57,7 @@ from syncer.review import (
     ReviewRule,
     has_drift,
 )
-from syncer.session import Session
-from syncer.state import State
+from syncer.session import CheckJob, Session
 
 _CHECK_STATE = {
     "checked": Qt.Checked,
@@ -96,11 +94,6 @@ def _tally_text(counts: dict[str, int]) -> str:
     return ", ".join(bits) if bits else "in sync"
 
 
-def _error_detail(errors) -> str:
-    """The per-file failure list every sync-result box itemises."""
-    return "\n".join(f"{e.rel_path}: {e.message}" for e in errors)
-
-
 def _make_inert(item: QTreeWidgetItem) -> None:
     """Greyed, no tick box. Greying is the brush's job, not ItemIsEnabled's:
     disabled items don't receive itemClicked, which a resolvable or unlockable
@@ -125,13 +118,11 @@ class CheckWorker(QThread):
     # (CheckResult, cancelled) — a cancelled check's result is truncated.
     check_finished = Signal(object, bool)
 
-    def __init__(
-        self, rule: SyncRule, baseline: dict, collisions: list[NamespaceCollision], parent=None
-    ):
+    def __init__(self, job: CheckJob, parent=None):
         super().__init__(parent)
-        self.rule = rule
-        self.collisions = collisions
-        self._baseline = baseline
+        # Handed back to `Session.check_finished`, which compares it against the
+        # config as it stands by then.
+        self.job = job
         self._cancelled = False
         self._last_emit = 0.0
 
@@ -146,11 +137,11 @@ class CheckWorker(QThread):
 
     def run(self) -> None:
         result = check(
-            self.rule,
-            baseline=self._baseline,
+            self.job.rule,
+            baseline=self.job.baseline,
             progress=self._report,
             cancel=lambda: self._cancelled,
-            collisions=self.collisions,
+            collisions=self.job.collisions,
         )
         self.check_finished.emit(result, self._cancelled)
 
@@ -196,9 +187,9 @@ class ReviewPane(QWidget):
         super().__init__(parent)
         self._session = session
         self._current_rule_id: str | None = None
-        self._pending_check_ids: list[str] = []
         self._worker: CheckWorker | None = None
         self._check_cancelled = False
+        self._checking = False
 
         app = QCoreApplication.instance()
         if app is not None:
@@ -272,7 +263,7 @@ class ReviewPane(QWidget):
         """(Re-)check every rule, one at a time. Each completed re-check
         re-blocks any of its masters still missing (spec.md §8: the unlock is
         in-session only)."""
-        self._pending_check_ids = list(self._session.rules)
+        self._session.queue_all_checks()
         self._run_next_check()
 
     def check_rule(self, rule_id: str) -> None:
@@ -284,19 +275,18 @@ class ReviewPane(QWidget):
     def current_rule_id(self) -> str | None:
         return self._current_rule_id
 
-    def apply_config(self, config: Config, state: State) -> None:
-        """The rule set and/or state changed outside the normal check/sync
-        flow — an add/edit/delete-rule action, or a config-reload's
-        reconciliation purge (spec.md §10). Per-rule session state (review,
-        selection, unlock) survives only for a rule whose definition is
-        unchanged — an edited rule's old review would show stale replicas.
+    def apply_config(self, config: Config) -> None:
+        """The rule set changed outside the normal check/sync flow — an
+        add/edit/delete-rule action or a config reload. The session adopts it
+        (purging `state.json` as it goes, spec.md §10); this redraws from what
+        it reports. Per-rule session state (review, selection, unlock)
+        survives only for a rule whose definition is unchanged — an edited
+        rule's old review would show stale replicas.
         Rebuilds the left pane's rows, keeping the current selection when the
         selected rule survives. A changed replica name relabels the tree
         without invalidating any review.
         """
-        adoption = self._session.adopt_config(config, state)
-        self._pending_check_ids = [k for k in self._pending_check_ids if k in self._session.rules]
-
+        adoption = self._session.adopt_config(config)
         self._repopulate_and_select(self._current_rule_id, adoption.unchanged)
         if adoption.replica_names_changed:
             # The tree shows names, so a rename relabels it even for a rule
@@ -304,10 +294,7 @@ class ReviewPane(QWidget):
             self._relabel_replica_items()
 
     def _queue_check(self, rule_id: str) -> None:
-        """Adds one rule to the check queue without dropping rules already
-        queued (e.g. by an in-progress "Check")."""
-        if rule_id not in self._pending_check_ids:
-            self._pending_check_ids.append(rule_id)
+        self._session.queue_check(rule_id)
         self._run_next_check()
 
     def _cancel_check(self) -> None:
@@ -316,7 +303,7 @@ class ReviewPane(QWidget):
         if self._worker is not None:
             self._worker.cancel()
             self._check_cancelled = True
-        self._pending_check_ids.clear()
+        self._session.cancel_checks()
 
     def _stop_workers(self) -> None:
         if self._worker is not None:
@@ -330,11 +317,15 @@ class ReviewPane(QWidget):
         if index == 0 and new < _MIN_NAME_COLUMN_WIDTH:
             self.tree.setColumnWidth(0, _MIN_NAME_COLUMN_WIDTH)
 
-    def _set_checking(self, checking: bool) -> None:
+    def _refresh_checking(self) -> None:
         """The one place the Check/Cancel buttons and `checkingChanged` change,
-        so they can't drift apart; emits only on an actual transition."""
-        if self.btn_check.isEnabled() != checking:
+        so they can't drift apart. A check is running while one is queued or
+        in flight; emits only on an actual transition, tracked in `_checking`
+        rather than read back out of an inverted button property."""
+        checking = self._session.has_pending_checks() or self._worker is not None
+        if checking == self._checking:
             return
+        self._checking = checking
         self.btn_check.setEnabled(not checking)
         self.btn_cancel_check.setVisible(checking)
         self.checkingChanged.emit(checking)
@@ -346,20 +337,17 @@ class ReviewPane(QWidget):
             # QThread.finished, not tested via isRunning(): check_finished can
             # be delivered while the thread is still winding down.)
             return
-        if not self._pending_check_ids:
+        job = self._session.next_check()
+        if job is None:
             self.status_label.setText(
                 "Check cancelled." if self._check_cancelled else "Check complete."
             )
             self._check_cancelled = False
-            self._set_checking(False)
+            self._refresh_checking()
             return
-        rule_id = self._pending_check_ids.pop(0)
-        rule = self._session.rules[rule_id]
-        self.status_label.setText(f"Checking {rule.name}…")
-        self._set_checking(True)
-        self._worker = CheckWorker(
-            rule, self._session.baseline(rule_id), self._session.collisions, self
-        )
+        self.status_label.setText(f"Checking {job.rule.name}…")
+        self._worker = CheckWorker(job, self)
+        self._refresh_checking()
         self._worker.progress.connect(self._on_check_progress)
         self._worker.check_finished.connect(self._on_check_finished)
         self._worker.finished.connect(self._on_worker_finished)
@@ -369,30 +357,13 @@ class ReviewPane(QWidget):
         self.status_label.setText(f"Checking… {done}/{total}  {current_path}")
 
     def _on_check_finished(self, result: CheckResult, cancelled: bool) -> None:
-        if cancelled:
-            # Truncated: rendering it would under-report drift (even "in sync").
-            return
-        current_rule = self._session.rules.get(result.rule_id)
         # Still set here: _worker is cleared on QThread.finished, queued after this.
-        worker = self._worker
-        if (
-            current_rule is None
-            or worker.rule != current_rule
-            or collisions_for_rule(result.rule_id, worker.collisions)
-            != collisions_for_rule(result.rule_id, self._session.collisions)
-        ):
-            # The rule was deleted or edited (apply_config) mid-check, or
-            # another rule's edit changed its collisions: this result
-            # describes the old config, so syncing it could write to a replica
-            # or namespace no longer valid. Re-check the rule.
-            if current_rule is not None and result.rule_id not in self._pending_check_ids:
-                self._pending_check_ids.append(result.rule_id)
+        outcome = self._session.check_finished(self._worker.job, result, cancelled)
+        if not outcome.applied:
             return
-        # Equal to the session's for this rule (checked above).
-        self._session.record_check(result)
         self._refresh_rule_list()
-        if result.rule_id == self._current_rule_id:
-            self._show_rule(result.rule_id)
+        if outcome.rule_id == self._current_rule_id:
+            self._show_rule(outcome.rule_id)
 
     def _on_worker_finished(self) -> None:
         # Queued after check_finished, so the result is already applied.
@@ -534,7 +505,9 @@ class ReviewPane(QWidget):
                 change, action = self._collision_banner(self._current_rule_id, node.collision), ""
             else:
                 change = "Master is missing — ordinary sync is blocked for this namespace."
-                action = "" if preview else "Unlock →"
+                # The same predicate the click handler acts on, so the offer
+                # and the action it promises can't drift apart.
+                action = "Unlock →" if node.unlock_offered and not preview else ""
             item = _inert_item(parent, node.landing_path, change, action)
         elif isinstance(node, ReviewMaster) and node.is_file:
             # A file master has no folder in the replica, so its one file
@@ -740,7 +713,7 @@ class ReviewPane(QWidget):
             return  # cancelled at the confirm prompt — nothing applied
         result = self._session.overwrite(rule_id, changes_by_replica)
         if result.errors:
-            QMessageBox.warning(self, "Finished with errors", _error_detail(result.errors))
+            QMessageBox.warning(self, "Finished with errors", error_detail(result.errors))
         self._queue_check(rule_id)
 
     def _sync_all_safe(self) -> None:
@@ -779,7 +752,7 @@ class ReviewPane(QWidget):
         # safe and delete picks need no separate batching here.
         self._report_sync(rule_id, self._session.sync_selected(rule_id))
 
-    def _report_sync(self, rule_id: str, result) -> None:
+    def _report_sync(self, rule_id: str, result: SyncResult | None) -> None:
         """Tells the user how a sync went, then re-checks. `result` is None
         when the session had nothing to apply, which needs neither."""
         if result is None:
@@ -789,7 +762,7 @@ class ReviewPane(QWidget):
                 self,
                 "Sync finished with errors",
                 f"Copied {result.copied}, deleted {result.deleted}, "
-                f"{len(result.errors)} error(s):\n\n{_error_detail(result.errors)}",
+                f"{len(result.errors)} error(s):\n\n{error_detail(result.errors)}",
             )
         else:
             QMessageBox.information(

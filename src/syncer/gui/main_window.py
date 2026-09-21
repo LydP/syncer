@@ -36,7 +36,7 @@ from syncer.gui.review_pane import ReviewPane
 from syncer.gui.rule_dialog import RuleDialog
 from syncer.gui.update_dialog import UpdateDialog
 from syncer.session import Session
-from syncer.state import State, reconcile_and_save
+from syncer.state import State
 from syncer.storage import StorageLayout, SyncerError
 from syncer.update_apply import PreparedUpdate, install_update
 
@@ -264,9 +264,8 @@ class MainWindow(QMainWindow):
 
     def _adopt_config(self, config: Config) -> None:
         """The one path for every config change — GUI add/edit/delete and a
-        reload alike (spec.md §10): purge state.json of anything no longer
-        configured, then hand the new rules and state to the review pane.
+        reload alike. The purge of anything no longer configured (spec.md §10)
+        is the session's, not this window's: it owns the `State` being purged.
         """
-        state = reconcile_and_save(self._storage.state_path, self._session.state, config)
-        self.review_pane.apply_config(config, state)
+        self.review_pane.apply_config(config)
         self._refresh_view()

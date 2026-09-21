@@ -6,7 +6,7 @@ import pytest
 from syncer.check import check, scan_master_layout
 from syncer.config import Config, Master, ReplicaName, SyncRule, normalize_replica_path
 from syncer.review import changes_by_replica, iter_leaves, tally
-from syncer.session import Session
+from syncer.session import CheckOutcome, Session
 from syncer.state import State
 
 EMPTY_STATE = State(version=1, hash_algo="sha256", rules={})
@@ -25,15 +25,166 @@ def _session(layout, *rules, state=EMPTY_STATE):
     return Session(layout, Config(version=1, rules=list(rules)), state)
 
 
+def _run(job):
+    """What the Qt layer's CheckWorker does off-thread with the job it was handed."""
+    return check(job.rule, baseline=job.baseline, collisions=job.collisions)
+
+
 def _checked(session, rule_id="r1"):
-    """Runs a real check of the rule and hands the result to the session, the
-    way the Qt layer does after its worker finishes."""
-    result = check(
-        session.rules[rule_id],
-        baseline=session.baseline(rule_id),
-        collisions=session.collisions,
-    )
-    session.record_check(result)
+    """Runs a real check of the rule the way the Qt layer does: pull the job,
+    run it, hand the result back."""
+    session.queue_check(rule_id)
+    job = session.next_check()
+    session.check_finished(job, _run(job), cancelled=False)
+
+
+def test_a_completed_check_is_applied_and_becomes_the_rules_tree(master_and_replica, layout):
+    master, replica = master_and_replica
+    (master / "a.txt").write_text("a")
+    session = _session(layout, _rule(master, replica))
+    session.queue_check("r1")
+
+    job = session.next_check()
+    outcome = session.check_finished(job, _run(job), cancelled=False)
+
+    assert outcome == CheckOutcome(rule_id="r1", applied=True)
+    assert session.tally("r1") == {"safe": 1, "delete": 0, "conflict": 0, "context": 0}
+    assert session.next_check() is None
+
+
+def test_a_cancelled_result_is_discarded_even_for_a_still_valid_rule(master_and_replica, layout):
+    """A cancelled check is truncated, so showing it would under-report drift."""
+    master, replica = master_and_replica
+    (master / "a.txt").write_text("a")
+    session = _session(layout, _rule(master, replica))
+    session.queue_check("r1")
+
+    job = session.next_check()
+    outcome = session.check_finished(job, _run(job), cancelled=True)
+
+    assert outcome == CheckOutcome(rule_id="r1", applied=False)
+    assert session.tree("r1") is None
+
+
+def test_a_result_for_a_rule_edited_mid_check_is_discarded_and_the_rule_requeued(
+    master_and_replica, layout
+):
+    master, replica = master_and_replica
+    (master / "a.txt").write_text("a")
+    rule = _rule(master, replica)
+    session = _session(layout, rule)
+    session.queue_check("r1")
+    job = session.next_check()
+    result = _run(job)
+    edited = replace(rule, ignore=["*.tmp"])
+
+    session.adopt_config(Config(version=1, rules=[edited]))
+    outcome = session.check_finished(job, result, cancelled=False)
+
+    assert outcome == CheckOutcome(rule_id="r1", applied=False)
+    assert session.has_pending_checks()
+    assert session.tree("r1") is None
+    assert session.next_check().rule == edited
+
+
+def test_a_result_for_a_rule_deleted_mid_check_is_discarded_and_not_requeued(
+    master_and_replica, layout
+):
+    master, replica = master_and_replica
+    (master / "a.txt").write_text("a")
+    session = _session(layout, _rule(master, replica))
+    session.queue_check("r1")
+    job = session.next_check()
+    result = _run(job)
+
+    session.adopt_config(Config(version=1, rules=[]))
+    outcome = session.check_finished(job, result, cancelled=False)
+
+    assert outcome == CheckOutcome(rule_id="r1", applied=False)
+    assert session.next_check() is None
+
+
+def test_a_result_whose_collisions_changed_because_another_rule_was_edited_is_requeued(
+    master_and_replica, tmp_path, layout
+):
+    master, replica = master_and_replica
+    (master / "a.txt").write_text("a")
+    rule = _rule(master, replica)
+    other_master = tmp_path / "elsewhere" / "master"
+    other_master.mkdir(parents=True)
+    other = _rule(tmp_path / "unrelated-master", replica, rule_id="r2")
+    session = _session(layout, rule, other)
+    session.queue_check("r1")
+    job = session.next_check()
+    result = _run(job)
+
+    # r2 now lands a "master" namespace in the replica r1 already fills.
+    colliding = _rule(other_master, replica, rule_id="r2")
+    session.adopt_config(Config(version=1, rules=[rule, colliding]))
+    outcome = session.check_finished(job, result, cancelled=False)
+
+    assert outcome == CheckOutcome(rule_id="r1", applied=False)
+    assert session.has_pending_checks()
+    assert session.tree("r1") is None
+
+
+def test_queueing_an_already_queued_rule_does_not_enqueue_it_twice(master_and_replica, layout):
+    master, replica = master_and_replica
+    session = _session(layout, _rule(master, replica))
+
+    session.queue_check("r1")
+    session.queue_check("r1")
+
+    assert session.next_check().rule_id == "r1"
+    assert session.next_check() is None
+
+
+def test_cancelling_checks_clears_the_whole_queue_not_just_the_rule_in_flight(
+    master_and_replica, tmp_path, layout
+):
+    master, replica = master_and_replica
+    other = _rule(tmp_path / "other-master", tmp_path / "other-replica", rule_id="r2")
+    third = _rule(tmp_path / "third-master", tmp_path / "third-replica", rule_id="r3")
+    session = _session(layout, _rule(master, replica), other, third)
+    for rule_id in ("r1", "r2", "r3"):
+        session.queue_check(rule_id)
+    in_flight = session.next_check()
+
+    session.cancel_checks()
+
+    assert in_flight.rule_id == "r1"
+    assert not session.has_pending_checks()
+    assert session.next_check() is None
+
+
+def test_queueing_every_check_drains_in_rule_order(master_and_replica, tmp_path, layout):
+    master, replica = master_and_replica
+    other = _rule(tmp_path / "other-master", tmp_path / "other-replica", rule_id="r2")
+    third = _rule(tmp_path / "third-master", tmp_path / "third-replica", rule_id="r3")
+    session = _session(layout, _rule(master, replica), other, third)
+    session.queue_check("r3")  # already queued: a check-all restarts from rule order
+
+    session.queue_all_checks()
+
+    drained = []
+    while (job := session.next_check()) is not None:
+        drained.append(job.rule_id)
+    assert drained == ["r1", "r2", "r3"]
+
+
+def test_adopting_a_config_drops_deleted_rules_from_the_queue(
+    master_and_replica, tmp_path, layout
+):
+    master, replica = master_and_replica
+    rule = _rule(master, replica)
+    other = _rule(tmp_path / "other-master", tmp_path / "other-replica", rule_id="r2")
+    session = _session(layout, rule, other)
+    session.queue_all_checks()
+
+    session.adopt_config(Config(version=1, rules=[rule]))
+
+    assert session.next_check().rule_id == "r1"
+    assert session.next_check() is None
 
 
 def test_a_rule_has_no_tree_until_it_is_checked(master_and_replica, layout):
@@ -102,7 +253,7 @@ def test_editing_a_rule_clears_its_tick_and_review(master_and_replica, layout):
     _checked(session)
     session.toggle("r1", _leaf(session, "a.txt"))
 
-    session.adopt_config(Config(version=1, rules=[replace(rule, ignore=["*.tmp"])]), EMPTY_STATE)
+    session.adopt_config(Config(version=1, rules=[replace(rule, ignore=["*.tmp"])]))
 
     assert session.tree("r1") is None
     assert session.selected_count("r1") == 0
@@ -120,7 +271,7 @@ def test_an_unchanged_rule_keeps_its_tick_and_review_when_another_rule_is_added(
     session.toggle("r1", leaf)
     other = _rule(tmp_path / "other-master", tmp_path / "other-replica", rule_id="r2")
 
-    adoption = session.adopt_config(Config(version=1, rules=[rule, other]), EMPTY_STATE)
+    adoption = session.adopt_config(Config(version=1, rules=[rule, other]))
 
     assert adoption.unchanged == {"r1"}
     assert adoption.replica_names_changed is False
@@ -145,13 +296,13 @@ def test_renaming_a_replica_is_reported_without_invalidating_the_review(
         replica_names=[ReplicaName(path=str(replica), name="Project A")],
     )
 
-    adoption = session.adopt_config(named, EMPTY_STATE)
+    adoption = session.adopt_config(named)
 
     assert adoption.replica_names_changed is True
     assert adoption.unchanged == {"r1"}
     assert session.tree("r1") is not None
     # Asked after the fact it would be False: the old config is gone.
-    assert session.adopt_config(named, EMPTY_STATE).replica_names_changed is False
+    assert session.adopt_config(named).replica_names_changed is False
 
 
 def test_a_tick_on_a_file_that_has_since_become_a_conflict_never_reaches_sync_selected(

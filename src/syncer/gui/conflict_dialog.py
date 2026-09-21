@@ -343,6 +343,12 @@ def confirm_bulk_overwrite(parent, by_replica: dict[str, list[FileChange]]) -> b
     return box.clickedButton() is confirm
 
 
+def error_detail(errors) -> str:
+    """The per-file failure list every sync-result box itemises. One home, so
+    the wording can't drift between the review pane and this dialog."""
+    return "\n".join(f"{e.rel_path}: {e.message}" for e in errors)
+
+
 def bulk_overwrite(
     parent,
     rule: SyncRule,
@@ -362,6 +368,5 @@ def bulk_overwrite(
         return None
     result = run_sync(rule, by_replica, state, state_path, logs_dir)
     if result.errors:
-        detail = "\n".join(f"{e.rel_path}: {e.message}" for e in result.errors)
-        QMessageBox.warning(parent, "Finished with errors", detail)
+        QMessageBox.warning(parent, "Finished with errors", error_detail(result.errors))
     return result
