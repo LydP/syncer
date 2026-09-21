@@ -11,7 +11,7 @@ Conflict resolution (issue #7) is wired in via `syncer.gui.conflict_dialog`:
 the "Resolve conflicts" button and each conflict leaf's "Resolve" cell open
 `ConflictDialog`; the replica branch's context menu offers the per-category
 bulk actions. Rule add/edit/delete itself lives in `syncer.gui.main_window`
-(issue #8); `apply_config`/`check_rule` below are this pane's side of that
+(issue #8); `apply_adoption`/`check_rule` below are this pane's side of that
 wiring — the rule list and its check state, not the add/edit/delete UI.
 """
 
@@ -46,8 +46,8 @@ from syncer.check import (
     other_rule_names,
     scan_master_layout,
 )
-from syncer.config import Config, SyncRule, master_basename, replica_label
-from syncer.gui.conflict_dialog import ConflictDialog, confirm_bulk_overwrite, error_detail
+from syncer.config import SyncRule, master_basename, replica_label
+from syncer.gui.conflict_dialog import ConflictDialog, bulk_overwrite, error_detail
 from syncer.review import (
     CATEGORY_LABEL,
     CONFLICT_CATEGORIES,
@@ -57,7 +57,7 @@ from syncer.review import (
     ReviewRule,
     has_drift,
 )
-from syncer.session import CheckJob, Session
+from syncer.session import CheckJob, ConfigAdoption, Session, SyncResult
 
 _CHECK_STATE = {
     "checked": Qt.Checked,
@@ -249,7 +249,7 @@ class ReviewPane(QWidget):
 
         self.rule_list.currentRowChanged.connect(self._on_rule_row_changed)
         # Populate from the initial rules: a launch with an existing config.toml
-        # never goes through apply_config, so the pane seeds itself here.
+        # never goes through apply_adoption, so the pane seeds itself here.
         self._repopulate_and_select(None, set())
 
     def _checked_rule_id(self) -> str | None:
@@ -275,18 +275,14 @@ class ReviewPane(QWidget):
     def current_rule_id(self) -> str | None:
         return self._current_rule_id
 
-    def apply_config(self, config: Config) -> None:
+    def apply_adoption(self, adoption: ConfigAdoption) -> None:
         """The rule set changed outside the normal check/sync flow — an
-        add/edit/delete-rule action or a config reload. The session adopts it
-        (purging `state.json` as it goes, spec.md §10); this redraws from what
-        it reports. Per-rule session state (review, selection, unlock)
-        survives only for a rule whose definition is unchanged — an edited
-        rule's old review would show stale replicas.
-        Rebuilds the left pane's rows, keeping the current selection when the
+        add/edit/delete-rule action or a config reload — and the session has
+        adopted it (see `Session.adopt_config` for what survives); this
+        redraws from what it reports. Rebuilds the left pane's rows, keeping the current selection when the
         selected rule survives. A changed replica name relabels the tree
         without invalidating any review.
         """
-        adoption = self._session.adopt_config(config)
         self._repopulate_and_select(self._current_rule_id, adoption.unchanged)
         if adoption.replica_names_changed:
             # The tree shows names, so a rename relabels it even for a rule
@@ -392,7 +388,7 @@ class ReviewPane(QWidget):
         """Rebuilds the left pane's rows and lands on a row: `preferred_rule_id`
         if it survived the rule set changing, else the first one. The single
         place that decides which row is current afterwards — `__init__` and
-        `apply_config` both come through here, so a pane is never left
+        `apply_adoption` both come through here, so a pane is never left
         unpopulated or without a selection. `unchanged` names the rules whose
         cached review is still accurate, so reselecting one can skip the
         rebuild of the right pane.
@@ -641,19 +637,10 @@ class ReviewPane(QWidget):
             self._run_conflict_dialog(rule_id, queue)
 
     def _run_conflict_dialog(self, rule_id: str, queue: list[ReviewLeaf]) -> None:
-        dialog = ConflictDialog(
-            self._session.rules[rule_id],
-            queue,
-            self._session.state,
-            self._session.layout.state_path,
-            self._session.layout.logs_dir,
-            self._session.config,
-            self,
-        )
+        dialog = ConflictDialog(self._session, rule_id, queue, self)
         dialog.exec()
         if not dialog.resolved_any:
             return  # closed or skipped through — nothing on disk changed
-        self._session.replace_state(dialog.state)
         self._queue_check(rule_id)
 
     def _show_tree_context_menu(self, pos) -> None:
@@ -708,12 +695,8 @@ class ReviewPane(QWidget):
         self._queue_check(rule_id)
 
     def _bulk_overwrite(self, rule_id: str, replica_path: str, changes) -> None:
-        changes_by_replica = {replica_path: changes}
-        if not confirm_bulk_overwrite(self, changes_by_replica):
+        if bulk_overwrite(self, self._session, rule_id, {replica_path: changes}) is None:
             return  # cancelled at the confirm prompt — nothing applied
-        result = self._session.overwrite(rule_id, changes_by_replica)
-        if result.errors:
-            QMessageBox.warning(self, "Finished with errors", error_detail(result.errors))
         self._queue_check(rule_id)
 
     def _sync_all_safe(self) -> None:

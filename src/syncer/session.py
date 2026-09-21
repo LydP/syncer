@@ -25,7 +25,7 @@ from syncer.check import (
     collisions_for_rule,
     find_namespace_collisions,
 )
-from syncer.config import Config, SyncRule
+from syncer.config import Config, ConfigStore, SyncRule
 from syncer.conflict import apply_keep_replica, bulk_candidates_by_category, conflict_queue
 from syncer.review import (
     LeafKey,
@@ -87,8 +87,11 @@ class CheckOutcome(NamedTuple):
 
 
 class Session:
-    def __init__(self, layout: StorageLayout, config: Config, state: State):
+    def __init__(
+        self, layout: StorageLayout, config_store: ConfigStore, config: Config, state: State
+    ):
         self._layout = layout
+        self._config_store = config_store
         self._config = config
         self._state = state
         # Insertion-ordered: also the rule list's row order.
@@ -101,20 +104,9 @@ class Session:
         self._pending_checks: list[str] = []
 
     @property
-    def layout(self) -> StorageLayout:
-        """Where `state.json` and the sync logs live — read by the conflict
-        dialog until it applies its resolutions through the session (issue #48)."""
-        return self._layout
-
-    @property
     def state(self) -> State:
         """The one in-memory `State`: every sync, keep and resolve replaces it here."""
         return self._state
-
-    def replace_state(self, state: State) -> None:
-        """Adopts a `State` resolved elsewhere — until the conflict dialog
-        applies its resolutions through the session (issue #48) it carries its own."""
-        self._state = state
 
     @property
     def rules(self) -> Mapping[str, SyncRule]:
@@ -123,6 +115,18 @@ class Session:
     @property
     def config(self) -> Config:
         return self._config
+
+    def save_config(self, config: Config) -> ConfigAdoption:
+        """Writes `config` to `config.toml` and adopts it. A `ConfigClobberError`
+        (the file was hand-edited since it was loaded) propagates before
+        anything is adopted, so the session is left as it was."""
+        self._config_store.save(config)
+        return self.adopt_config(config)
+
+    def reload_config(self) -> ConfigAdoption:
+        """Re-reads `config.toml` and adopts it. A config that can't be read
+        raises a `SyncerError` before anything is adopted."""
+        return self.adopt_config(self._config_store.load())
 
     def adopt_config(self, config: Config) -> ConfigAdoption:
         """The rule set changed outside the normal check/sync flow — an

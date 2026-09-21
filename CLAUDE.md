@@ -45,15 +45,23 @@ a ~250MB download.
 **Module dependency chain** (each layer imports only from the ones before it):
 `storage.py` → `config.py` (config.toml) + `check.py` (drift detection) → `state.py` (state.json,
 imports `check.BaselineEntry`) → `sync.py` (executor) + `conflict.py` (resolution) → `review.py`
-(tree/bucketing model) → `gui/` (Qt). `conflict.py` and `gui/review_pane.py` both import from
-`review.py`, not from each other.
+(tree/bucketing model) → `session.py` (the live working set, ADR 0005) → `gui/` (Qt).
+`conflict.py` imports from `review.py`, and `session.py` from both; `gui/` reaches the workflow only
+through `session.py`.
 
-**Pure core / thin Qt adapter.** `review.py` and `conflict.py` are Qt-free: all tree-building,
-category-bucketing, diff-computation and selection-rollup logic lives there and is covered by
-pytest. `gui/review_pane.py` and `gui/conflict_dialog.py` only wire widgets to that logic — no
-decisions live in the GUI layer. Per their own module docstrings, the `gui/` files are **not**
-part of the TDD loop and are **not** unit-tested; they're verified by running the app. Keep new
-logic in the pure layer even when it's GUI-triggered, so it stays testable.
+**Pure core / thin Qt adapter.** `review.py`, `conflict.py` and `session.py` are Qt-free:
+all tree-building, category-bucketing, diff-computation and selection-rollup logic lives in the
+first two, and is covered by pytest. `session.py` is the stateful object on top of them (ADR 0005):
+it owns the in-memory `State`, each rule's review tree (which carries its master unlocks), the tick
+selection, the check queue and its stale-result gate, and it applies every sync, keep, overwrite
+and config save/reload. It never starts a thread — the Qt layer pulls `next_check()`, runs
+`check()` on a worker, and hands the result back via `check_finished()`. `app.py` builds the
+`Session` from a loaded config and state and hands it to `MainWindow`. `gui/review_pane.py`,
+`gui/conflict_dialog.py` and `gui/main_window.py` only wire widgets to the Session — no
+decisions live in the GUI layer, and nothing in `gui/` calls the executor or `state.py` directly.
+Per their own module docstrings, the `gui/` files are **not** part of the TDD loop and are **not**
+unit-tested; they're verified by running the app. Keep new logic in the pure layer even when it's
+GUI-triggered, so it stays testable.
 
 **The three-way comparison model** (`check.py`, spec.md §5/§9) is the core domain logic: every
 file is compared across *baseline* (the last-known-synced content, from `state.json`), *master*,

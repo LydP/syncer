@@ -4,10 +4,21 @@ from dataclasses import replace
 import pytest
 
 from syncer.check import check, scan_master_layout
-from syncer.config import Config, Master, ReplicaName, SyncRule, normalize_replica_path
+from syncer.config import (
+    Config,
+    ConfigClobberError,
+    ConfigStore,
+    Master,
+    ReplicaName,
+    SyncRule,
+    load_config,
+    normalize_replica_path,
+    save_config,
+)
 from syncer.review import changes_by_replica, iter_leaves, tally
 from syncer.session import CheckOutcome, Session
-from syncer.state import State
+from syncer.state import State, load_state
+from syncer.storage import SyncerError
 
 EMPTY_STATE = State(version=1, hash_algo="sha256", rules={})
 
@@ -22,7 +33,8 @@ def _rule(master_dir, replica_dir, rule_id="r1"):
 
 
 def _session(layout, *rules, state=EMPTY_STATE):
-    return Session(layout, Config(version=1, rules=list(rules)), state)
+    store = ConfigStore(layout.config_path, layout.backups_dir)
+    return Session(layout, store, Config(version=1, rules=list(rules)), state)
 
 
 def _run(job):
@@ -417,9 +429,10 @@ def test_a_recheck_reblocks_an_unlocked_master_that_is_still_missing(tmp_path, l
     assert session.blocked_count("r1") == 1
 
 
-def _conflicted_session(layout, master, replica):
-    (master / "a.txt").write_text("from master")
-    (replica / "master" / "a.txt").write_text("edited in the replica")
+def _conflicted_session(layout, master, replica, *names):
+    for name in names or ("a.txt",):
+        (master / name).write_text(f"{name} from master")
+        (replica / "master" / name).write_text(f"{name} edited in the replica")
     session = _session(layout, _rule(master, replica))
     _checked(session)
     return session
@@ -437,7 +450,7 @@ def test_keep_records_the_replicas_version_so_the_next_check_stops_flagging_it(
 
     assert session.tally("r1")["conflict"] == 0
     assert layout.state_path.exists()
-    assert (replica / "master" / "a.txt").read_text() == "edited in the replica"
+    assert (replica / "master" / "a.txt").read_text() == "a.txt edited in the replica"
 
 
 def test_keep_on_an_unreadable_file_merges_and_saves_nothing(master_and_replica, layout):
@@ -461,7 +474,7 @@ def test_overwrite_replaces_the_replicas_version_with_the_masters(master_and_rep
     result = session.overwrite("r1", changes_by_replica(session.conflict_queue("r1")))
 
     assert result.copied == 1
-    assert (replica / "master" / "a.txt").read_text() == "from master"
+    assert (replica / "master" / "a.txt").read_text() == "a.txt from master"
     assert session.state == result.state
 
 
@@ -504,15 +517,126 @@ def test_a_preview_shows_what_each_replica_should_hold_with_nothing_actionable(
     assert tally(preview.replicas) == {"safe": 0, "delete": 0, "conflict": 0, "context": 1}
 
 
-def test_state_a_dialog_resolved_against_replaces_the_sessions(master_and_replica, layout):
+def test_saving_a_config_writes_it_to_disk_and_adopts_it(master_and_replica, tmp_path, layout):
+    master, replica = master_and_replica
+    rule = _rule(master, replica)
+    other = _rule(tmp_path / "other-master", tmp_path / "other-replica", rule_id="r2")
+    session = _session(layout, rule)
+
+    adoption = session.save_config(Config(version=1, rules=[rule, other]))
+
+    assert list(session.rules) == ["r1", "r2"]
+    assert load_config(layout.config_path).rules == [rule, other]
+    assert adoption.unchanged == {"r1"}
+
+
+def test_a_save_over_an_external_edit_raises_and_leaves_the_session_untouched(
+    master_and_replica, layout
+):
+    master, replica = master_and_replica
+    (master / "a.txt").write_text("a")
+    rule = _rule(master, replica)
+    session = _session(layout, rule)
+    _checked(session)
+    session.sync_all_safe("r1")
+    # A hand-edit the session's store never loaded.
+    save_config(layout.config_path, Config(version=1, rules=[rule]), layout.backups_dir)
+
+    with pytest.raises(ConfigClobberError):
+        session.save_config(Config(version=1, rules=[]))
+
+    assert list(session.rules) == ["r1"]
+    assert session.tree("r1") is not None
+    # Adopting first would have purged r1's baseline for a rule still on disk.
+    assert "r1" in session.state.rules
+    assert "r1" in load_state(layout.state_path).state.rules
+
+
+def test_reloading_adopts_a_config_edited_on_disk(master_and_replica, tmp_path, layout):
+    master, replica = master_and_replica
+    rule = _rule(master, replica)
+    other = _rule(tmp_path / "other-master", tmp_path / "other-replica", rule_id="r2")
+    session = _session(layout, rule)
+    save_config(layout.config_path, Config(version=1, rules=[rule, other]), layout.backups_dir)
+
+    adoption = session.reload_config()
+
+    assert list(session.rules) == ["r1", "r2"]
+    assert adoption.unchanged == {"r1"}
+
+
+def test_a_reload_of_an_unreadable_config_raises_and_leaves_the_session_untouched(
+    master_and_replica, layout
+):
     master, replica = master_and_replica
     session = _session(layout, _rule(master, replica))
-    resolved = State(version=1, hash_algo="sha256", rules={"r1": {}})
+    layout.config_path.write_text("this is [not toml", encoding="utf-8")
 
-    session.replace_state(resolved)
+    with pytest.raises(SyncerError):
+        session.reload_config()
 
-    assert session.state is resolved
+    assert list(session.rules) == ["r1"]
 
 
-def test_the_session_exposes_the_storage_layout_its_state_is_saved_under(layout):
-    assert _session(layout).layout is layout
+def test_adopting_a_config_without_a_rule_purges_its_state_and_saves_at_once(
+    master_and_replica, layout
+):
+    master, replica = master_and_replica
+    (master / "a.txt").write_text("a")
+    rule = _rule(master, replica)
+    session = _session(layout, rule)
+    _checked(session)
+    session.sync_all_safe("r1")
+    assert "r1" in load_state(layout.state_path).state.rules
+
+    session.adopt_config(Config(version=1, rules=[]))
+
+    assert "r1" not in session.state.rules
+    assert "r1" not in load_state(layout.state_path).state.rules
+
+
+def test_an_unchanged_rule_keeps_its_unlock_when_another_rule_is_added(tmp_path, layout):
+    session = _multi_master_session(layout, tmp_path, "a", "b")
+    shutil.rmtree(tmp_path / "b")
+    _checked(session)
+    session.unlock("r1", "b")
+    other = _rule(tmp_path / "other-master", tmp_path / "other-replica", rule_id="r2")
+
+    session.adopt_config(Config(version=1, rules=[session.rules["r1"], other]))
+
+    assert session.blocked_count("r1") == 0
+
+
+def test_an_unchanged_rule_loses_its_review_when_another_rules_edit_changes_its_collisions(
+    master_and_replica, tmp_path, layout
+):
+    master, replica = master_and_replica
+    (master / "a.txt").write_text("a")
+    rule = _rule(master, replica)
+    session = _session(layout, rule, _rule(tmp_path / "unrelated-master", replica, rule_id="r2"))
+    _checked(session)
+    other_master = tmp_path / "elsewhere" / "master"
+    other_master.mkdir(parents=True)
+
+    # r2 now lands a "master" namespace in the replica r1 already fills.
+    adoption = session.adopt_config(
+        Config(version=1, rules=[rule, _rule(other_master, replica, rule_id="r2")])
+    )
+
+    assert "r1" not in adoption.unchanged
+    assert session.tree("r1") is None
+
+
+def test_a_resolution_applied_before_the_dialog_closes_early_is_kept(master_and_replica, layout):
+    master, replica = master_and_replica
+    session = _conflicted_session(layout, master, replica, "a.txt", "b.txt")
+    first, second = session.conflict_queue("r1")
+
+    # The dialog resolves one file as the user steps through, then is closed.
+    session.overwrite("r1", changes_by_replica([first]))
+    _checked(session)
+
+    assert (replica / "master" / first.name).read_text() == f"{first.name} from master"
+    assert (replica / "master" / second.name).read_text() == f"{second.name} edited in the replica"
+    assert [leaf.name for leaf in session.conflict_queue("r1")] == [second.name]
+    assert load_state(layout.state_path).state == session.state

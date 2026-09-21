@@ -3,9 +3,9 @@ delete, the first-run empty state, config-reload reconciliation, and the
 Help -> Check for updates... entry point (issue #37).
 
 Thin wiring only — matches review_pane.py/conflict_dialog.py's convention:
-save/reconcile decisions call straight into syncer.config/syncer.state (pure,
-unit-tested), this module only wires widgets and dialogs to them. Not
-covered by the TDD loop, verified by running the app.
+every save/reload/reconcile decision is `syncer.session.Session`'s (Qt-free,
+unit-tested); this module only wires widgets and dialogs to it. Not covered
+by the TDD loop, verified by running the app.
 """
 
 from __future__ import annotations
@@ -25,18 +25,11 @@ from PySide6.QtWidgets import (
 )
 
 from syncer import app_version
-from syncer.config import (
-    Config,
-    ConfigClobberError,
-    ConfigStore,
-    SyncRule,
-    without_rule,
-)
+from syncer.config import Config, ConfigClobberError, SyncRule, without_rule
 from syncer.gui.review_pane import ReviewPane
 from syncer.gui.rule_dialog import RuleDialog
 from syncer.gui.update_dialog import UpdateDialog
-from syncer.session import Session
-from syncer.state import State
+from syncer.session import ConfigAdoption, Session
 from syncer.storage import StorageLayout, SyncerError
 from syncer.update_apply import PreparedUpdate, install_update
 
@@ -58,27 +51,19 @@ class _EmptyStateWidget(QWidget):
 
 
 class MainWindow(QMainWindow):
-    """`state` must already be reconciled against `config` (app.py does so via
-    `reconcile_and_save`). From then on the `Session` owns the in-memory state.
+    """`session` must already be built from a config and a state reconciled
+    against it (app.py does so). The window keeps a copy of neither: every
+    config change goes through the session, which owns them. `layout` is only
+    for the app-update flow, which is not part of the check/sync workflow.
     """
 
-    def __init__(
-        self,
-        layout: StorageLayout,
-        config_store: ConfigStore,
-        config: Config,
-        state: State,
-        parent=None,
-    ):
+    def __init__(self, session: Session, layout: StorageLayout, parent=None):
         super().__init__(parent)
         version = app_version()
         self.setWindowTitle(f"Syncer v{version}" if version else "Syncer")
         self.resize(1100, 720)
         self._storage = layout
-        self._config_store = config_store
-        # The Session owns the live config too, so the window keeps no second
-        # copy that an interrupted _adopt_config could leave out of step.
-        self._session = Session(layout, config, state)
+        self._session = session
         self.review_pane = ReviewPane(self._session, self)
         self._empty_state = _EmptyStateWidget(self._add_rule, self)
 
@@ -169,7 +154,7 @@ class MainWindow(QMainWindow):
     def _add_rule(self) -> None:
         new_config = self._run_rule_dialog(None)
         if new_config is not None:
-            self._save_and_adopt(new_config)
+            self._save_config(new_config)
 
     def _edit_selected_rule(self) -> None:
         rule = self._selected_rule()
@@ -177,7 +162,7 @@ class MainWindow(QMainWindow):
             return
         edited_config = self._run_rule_dialog(rule)
         if edited_config is not None:
-            self._save_and_adopt(edited_config)
+            self._save_config(edited_config)
 
     def _delete_selected_rule(self) -> None:
         rule = self._selected_rule()
@@ -192,7 +177,7 @@ class MainWindow(QMainWindow):
             QMessageBox.No,
         )
         if confirm == QMessageBox.Yes:
-            self._save_and_adopt(without_rule(self._session.config, rule.id))
+            self._save_config(without_rule(self._session.config, rule.id))
 
     def _check_selected_rule(self) -> None:
         rule_id = self.review_pane.current_rule_id
@@ -201,11 +186,11 @@ class MainWindow(QMainWindow):
 
     def _reload_config(self) -> None:
         try:
-            config = self._config_store.load()
+            adoption = self._session.reload_config()
         except SyncerError as exc:
             QMessageBox.warning(self, "Reload config", str(exc))
             return
-        self._adopt_config(config)
+        self._show_adoption(adoption)
 
     # -- app update ------------------------------------------------------
 
@@ -254,18 +239,18 @@ class MainWindow(QMainWindow):
 
     # -- persistence -----------------------------------------------------
 
-    def _save_and_adopt(self, config: Config) -> None:
+    def _save_config(self, config: Config) -> None:
         try:
-            self._config_store.save(config)
+            adoption = self._session.save_config(config)
         except ConfigClobberError as exc:
             QMessageBox.warning(self, "Save failed", f"{exc}\n\nUse Reload config, then try again.")
             return
-        self._adopt_config(config)
+        self._show_adoption(adoption)
 
-    def _adopt_config(self, config: Config) -> None:
-        """The one path for every config change — GUI add/edit/delete and a
+    def _show_adoption(self, adoption: ConfigAdoption) -> None:
+        """The one redraw for every config change — GUI add/edit/delete and a
         reload alike. The purge of anything no longer configured (spec.md §10)
         is the session's, not this window's: it owns the `State` being purged.
         """
-        self.review_pane.apply_config(config)
+        self.review_pane.apply_adoption(adoption)
         self._refresh_view()

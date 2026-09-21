@@ -1,9 +1,10 @@
 """Qt adapter for the conflict-resolution dialog (issue #7, spec.md §9).
 
 Thin wiring only: every diff-panel, queue, and bulk-selection decision lives
-in `syncer.conflict` (pure, Qt-free, unit-tested). This module owns widgets
-and Qt signals and nothing else — it is not covered by the TDD loop, and is
-verified by running the app rather than by pytest (matching
+in `syncer.conflict` (pure, Qt-free, unit-tested), and every resolution is
+applied through the `Session` (ADR 0005). This module owns widgets, Qt
+signals and the confirm prompts and nothing else — it is not covered by the
+TDD loop, and is verified by running the app rather than by pytest (matching
 `syncer.gui.review_pane`'s own convention).
 """
 
@@ -11,7 +12,6 @@ from __future__ import annotations
 
 import html
 from datetime import datetime
-from pathlib import Path
 
 from PySide6.QtWidgets import (
     QDialog,
@@ -25,19 +25,16 @@ from PySide6.QtWidgets import (
 )
 
 from syncer.check import FileChange
-from syncer.config import Config, SyncRule, replica_label
+from syncer.config import replica_label
 from syncer.conflict import (
     DiffOp,
     DiffPanel,
     FileMeta,
-    apply_keep_replica,
     build_conflict_view,
     summarize_overwrite,
 )
 from syncer.review import CATEGORY_LABEL, ReviewLeaf, changes_by_replica
-from syncer.state import State
-from syncer.sync import SyncResult
-from syncer.sync import sync as run_sync
+from syncer.session import Session, SyncResult
 
 _CALLOUT_STYLE = "color: #b35900; font-weight: bold;"
 _META_STYLE = "color: #9a9a9a;"
@@ -99,32 +96,21 @@ class ConflictDialog(QDialog):
     file immediately advances to the next, closing when the queue empties or
     the user dismisses it.
 
-    `.state` holds the (possibly updated) `State` after the dialog closes —
-    callers should adopt it in place of what they passed in. `.resolved_any`
-    says whether any file was actually resolved, so a caller can skip
-    re-checking after a dialog that was only closed or skipped through.
+    Each resolution is applied through the session as the user steps to it, not
+    batched to the end, so closing the dialog halfway keeps what was already
+    resolved. `.resolved_any` says whether any file was actually resolved, so a
+    caller can skip re-checking after a dialog that was only closed or skipped
+    through.
     """
 
-    def __init__(
-        self,
-        rule: SyncRule,
-        queue: list[ReviewLeaf],
-        state: State,
-        state_path: Path,
-        logs_dir: Path,
-        config: Config,
-        parent=None,
-    ):
+    def __init__(self, session: Session, rule_id: str, queue: list[ReviewLeaf], parent=None):
         super().__init__(parent)
         self.setWindowTitle("Resolve conflict")
         self.resize(720, 520)
-        self._rule = rule
+        self._session = session
+        self._rule_id = rule_id
         self._queue = queue
         self._index = 0
-        self._state_path = state_path
-        self._logs_dir = logs_dir
-        self._config = config
-        self.state = state
         self.resolved_any = False
 
         self._position_label = QLabel()
@@ -209,10 +195,10 @@ class ConflictDialog(QDialog):
         self.btn_overwrite_all.setText(f"Overwrite all remaining from master ({n_remaining})")
         self.btn_keep_all.setText(f"Keep all remaining as-is ({n_remaining})")
         self._file_label.setText(
-            f"{replica_label(self._config, leaf.replica_path)}\n{leaf.rel_path} — {leaf.label}"
+            f"{replica_label(self._session.config, leaf.replica_path)}\n{leaf.rel_path} — {leaf.label}"
         )
         self._file_label.setToolTip(leaf.replica_path)
-        view = build_conflict_view(self._rule, leaf.replica_path, leaf.file_change)
+        view = build_conflict_view(self._session.rules[self._rule_id], leaf.replica_path, leaf.file_change)
         self._callout_label.setVisible(view.callout is not None)
         if view.callout is not None:
             self._callout_label.setText(view.callout)
@@ -230,14 +216,7 @@ class ConflictDialog(QDialog):
             return
         if leaf.file_change.is_deletion and not _confirm_deletion(self, leaf.rel_path):
             return
-        result = run_sync(
-            self._rule,
-            {leaf.replica_path: [leaf.file_change]},
-            self.state,
-            self._state_path,
-            self._logs_dir,
-        )
-        self.state = result.state
+        result = self._session.overwrite(self._rule_id, {leaf.replica_path: [leaf.file_change]})
         if result.errors:
             QMessageBox.warning(self, "Couldn't overwrite", result.errors[0].message)
             return
@@ -253,44 +232,30 @@ class ConflictDialog(QDialog):
         leaf = self._current_leaf()
         if leaf is None:
             return
-        try:
-            self.state = apply_keep_replica(
-                self._rule,
-                {leaf.replica_path: [leaf.file_change]},
-                self.state,
-                self._state_path,
-            )
-        except OSError as exc:
-            QMessageBox.warning(self, "Couldn't keep replica's version", str(exc))
-            return
-        self.resolved_any = True
-        self._advance()
+        if self._try_keep({leaf.replica_path: [leaf.file_change]}):
+            self._advance()
 
     def _keep_all_remaining(self) -> None:
         # Records the replica's version as kept (unlike Skip, which leaves no
         # record). Changes no files, so it needs no confirm.
+        if self._try_keep(changes_by_replica(self._remaining())):
+            self.accept()
+
+    def _try_keep(self, by_replica: dict[str, list[FileChange]]) -> bool:
         try:
-            self.state = apply_keep_replica(
-                self._rule, changes_by_replica(self._remaining()), self.state, self._state_path
-            )
+            self._session.keep(self._rule_id, by_replica)
         except OSError as exc:
             QMessageBox.warning(self, "Couldn't keep replica's version", str(exc))
-            return
+            return False
         self.resolved_any = True
-        self.accept()
+        return True
 
     def _overwrite_all_remaining(self) -> None:
         result = bulk_overwrite(
-            self,
-            self._rule,
-            changes_by_replica(self._remaining()),
-            self.state,
-            self._state_path,
-            self._logs_dir,
+            self, self._session, self._rule_id, changes_by_replica(self._remaining())
         )
         if result is None:
             return
-        self.state = result.state
         if result.copied or result.deleted:
             self.resolved_any = True
             self.accept()
@@ -310,7 +275,7 @@ def _confirm_deletion(parent, rel_path: str) -> bool:
     return box.clickedButton() is confirm
 
 
-def confirm_bulk_overwrite(parent, by_replica: dict[str, list[FileChange]]) -> bool:
+def _confirm_bulk_overwrite(parent, by_replica: dict[str, list[FileChange]]) -> bool:
     """Takes the same `{replica_path: [FileChange]}` shape the apply half does
     (`sync()`, `Session.overwrite`), and derives the file and replica counts
     itself so no caller has to restate them. Named `by_replica` rather than
@@ -350,23 +315,18 @@ def error_detail(errors) -> str:
 
 
 def bulk_overwrite(
-    parent,
-    rule: SyncRule,
-    by_replica: dict[str, list[FileChange]],
-    state: State,
-    state_path: Path,
-    logs_dir: Path,
+    parent, session: Session, rule_id: str, by_replica: dict[str, list[FileChange]]
 ) -> SyncResult | None:
     """"Overwrite all from master" (spec.md §9): gated behind its own
-    confirm, since it discards local edits; a plain `sync.sync()` call once
+    confirm, since it discards local edits; `Session.overwrite` once
     confirmed — identical to the safe-drift path.
 
     Returns `None` when the user cancels, so "cancelled" stays distinct from
     "applied, and the state happens to be unchanged".
     """
-    if not confirm_bulk_overwrite(parent, by_replica):
+    if not _confirm_bulk_overwrite(parent, by_replica):
         return None
-    result = run_sync(rule, by_replica, state, state_path, logs_dir)
+    result = session.overwrite(rule_id, by_replica)
     if result.errors:
         QMessageBox.warning(parent, "Finished with errors", error_detail(result.errors))
     return result

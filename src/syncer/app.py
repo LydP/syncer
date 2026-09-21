@@ -14,6 +14,7 @@ from syncer import app_version
 from syncer.config import ConfigStore
 from syncer.gui.main_window import MainWindow
 from syncer.lock import AlreadyRunningError, acquire_lock, release_lock
+from syncer.session import Session
 from syncer.state import load_state, reconcile_and_save
 from syncer.storage import SyncerError, initialize_storage
 from syncer.update_apply import report_launched, settle_previous_update
@@ -57,7 +58,7 @@ def main() -> int:
         if load_result.warning:
             QMessageBox.warning(None, "Syncer", load_result.warning)
 
-        window = MainWindow(layout, config_store, config, state)
+        window = MainWindow(Session(layout, config_store, config, state), layout)
         window.show()
         return app.exec()
     finally:
