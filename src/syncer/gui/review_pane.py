@@ -1,9 +1,11 @@
 """Qt adapter for the review-and-sync screen (issue #6, spec.md §7).
 
 Thin wiring only: every tree-shape, bucketing, and selection-roll-up decision
-lives in `syncer.review` (pure, Qt-free, unit-tested). This module owns
-widgets and Qt signals and nothing else — it is not covered by the TDD loop,
-and is verified by running the app rather than by pytest.
+lives in `syncer.review` (pure, Qt-free, unit-tested), and the working set they
+act on — state, each rule's review tree, unlocks and ticks — lives in
+`syncer.session.Session` (ADR 0005). This module owns widgets and Qt signals
+and nothing else — it is not covered by the TDD loop, and is verified by
+running the app rather than by pytest.
 
 Conflict resolution (issue #7) is wired in via `syncer.gui.conflict_dialog`:
 the "Resolve conflicts" button and each conflict leaf's "Resolve" cell open
@@ -16,9 +18,7 @@ wiring — the rule list and its check state, not the add/edit/delete UI.
 from __future__ import annotations
 
 import time
-from collections import defaultdict
 from collections.abc import Iterator
-from pathlib import Path
 
 from PySide6.QtCore import QCoreApplication, QSignalBlocker, QThread, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFont
@@ -44,34 +44,22 @@ from syncer.check import (
     NamespaceCollision,
     check,
     collisions_for_rule,
-    find_namespace_collisions,
     other_rule_names,
     scan_master_layout,
 )
 from syncer.config import Config, SyncRule, master_basename, replica_label
-from syncer.conflict import apply_keep_replica, bulk_candidates_by_category, conflict_queue
-from syncer.gui.conflict_dialog import ConflictDialog, bulk_overwrite
+from syncer.gui.conflict_dialog import ConflictDialog, confirm_bulk_overwrite
 from syncer.review import (
     CATEGORY_LABEL,
     CONFLICT_CATEGORIES,
-    LeafKey,
     ReviewLeaf,
     ReviewMaster,
     ReviewReplica,
     ReviewRule,
-    blocked_master_count,
-    build_preview_rule,
-    build_review_rule,
     has_drift,
-    node_state,
-    resolve_selection,
-    rule_tally,
-    selection_by_bucket,
-    sync_all_safe_changes,
-    toggle,
 )
-from syncer.state import State, baseline_for_rule
-from syncer.sync import sync as run_sync
+from syncer.session import Session
+from syncer.state import State
 
 _CHECK_STATE = {
     "checked": Qt.Checked,
@@ -106,6 +94,11 @@ _MIN_NAME_COLUMN_WIDTH = 160
 def _tally_text(counts: dict[str, int]) -> str:
     bits = [f"{counts[bucket]} {words}" for bucket, words in _TALLY_WORDING if counts[bucket]]
     return ", ".join(bits) if bits else "in sync"
+
+
+def _error_detail(errors) -> str:
+    """The per-file failure list every sync-result box itemises."""
+    return "\n".join(f"{e.rel_path}: {e.message}" for e in errors)
 
 
 def _make_inert(item: QTreeWidgetItem) -> None:
@@ -195,32 +188,13 @@ class ReviewPane(QWidget):
     app-level concerns (config/state persistence stays with the host).
     """
 
-    conflictsRequested = Signal(str, str)  # rule_id, replica_path — issue #7's hook
     # True while any rule is being checked or queued to be; the host gates
     # actions that mustn't overlap a check (e.g. an app update) on it.
     checkingChanged = Signal(bool)
 
-    def __init__(
-        self,
-        config: Config,
-        state: State,
-        state_path: Path,
-        logs_dir: Path,
-        parent=None,
-    ):
+    def __init__(self, session: Session, parent=None):
         super().__init__(parent)
-        self._config = config
-        # Insertion-ordered: also the left pane's row order.
-        self._rules_by_id: dict[str, SyncRule] = {rule.id: rule for rule in config.rules}
-        # Recomputed only where _rules_by_id is (here and apply_config) — not
-        # per rule checked, since check_all() checks every rule in turn.
-        self._namespace_collisions: list[NamespaceCollision] = find_namespace_collisions(config.rules)
-        self._state = state
-        self._state_path = state_path
-        self._logs_dir = logs_dir
-
-        self._review: dict[str, ReviewRule] = {}
-        self._selected: defaultdict[str, frozenset[LeafKey]] = defaultdict(frozenset)
+        self._session = session
         self._current_rule_id: str | None = None
         self._pending_check_ids: list[str] = []
         self._worker: CheckWorker | None = None
@@ -287,10 +261,10 @@ class ReviewPane(QWidget):
         # never goes through apply_config, so the pane seeds itself here.
         self._repopulate_and_select(None, set())
 
-    def _current_review(self) -> tuple[str, ReviewRule] | None:
+    def _checked_rule_id(self) -> str | None:
+        """The current rule's id, unless it has no check result yet."""
         rule_id = self._current_rule_id
-        review_rule = self._review.get(rule_id) if rule_id else None
-        return None if review_rule is None else (rule_id, review_rule)
+        return rule_id if rule_id and self._session.tree(rule_id) is not None else None
 
     # -- checking ------------------------------------------------------
 
@@ -298,19 +272,13 @@ class ReviewPane(QWidget):
         """(Re-)check every rule, one at a time. Each completed re-check
         re-blocks any of its masters still missing (spec.md §8: the unlock is
         in-session only)."""
-        self._pending_check_ids = list(self._rules_by_id)
+        self._pending_check_ids = list(self._session.rules)
         self._run_next_check()
 
     def check_rule(self, rule_id: str) -> None:
         """Public entry point for main_window's toolbar/context-menu "Check"
         action (spec.md §10), which targets one rule rather than every rule."""
         self._queue_check(rule_id)
-
-    @property
-    def state(self) -> State:
-        """The one in-memory `State`: every sync/keep/resolve replaces it here,
-        so main_window reads it back rather than keeping its own copy."""
-        return self._state
 
     @property
     def current_rule_id(self) -> str | None:
@@ -326,30 +294,11 @@ class ReviewPane(QWidget):
         selected rule survives. A changed replica name relabels the tree
         without invalidating any review.
         """
-        old_rules_by_id = self._rules_by_id
-        old_collisions = self._namespace_collisions
-        names_changed = config.replica_names != self._config.replica_names
-        self._config = config
-        self._rules_by_id = {rule.id: rule for rule in config.rules}
-        self._namespace_collisions = find_namespace_collisions(config.rules)
-        self._state = state
-        # Another rule's edit can add or clear a collision on an otherwise
-        # unchanged rule, so its cached review is stale then too.
-        unchanged = {
-            k
-            for k, rule in self._rules_by_id.items()
-            if old_rules_by_id.get(k) == rule
-            and collisions_for_rule(k, old_collisions)
-            == collisions_for_rule(k, self._namespace_collisions)
-        }
-        self._review = {k: v for k, v in self._review.items() if k in unchanged}
-        self._selected = defaultdict(
-            frozenset, {k: v for k, v in self._selected.items() if k in unchanged}
-        )
-        self._pending_check_ids = [k for k in self._pending_check_ids if k in self._rules_by_id]
+        adoption = self._session.adopt_config(config, state)
+        self._pending_check_ids = [k for k in self._pending_check_ids if k in self._session.rules]
 
-        self._repopulate_and_select(self._current_rule_id, unchanged)
-        if names_changed:
+        self._repopulate_and_select(self._current_rule_id, adoption.unchanged)
+        if adoption.replica_names_changed:
             # The tree shows names, so a rename relabels it even for a rule
             # whose cached review (and so its tree) is still accurate.
             self._relabel_replica_items()
@@ -405,11 +354,11 @@ class ReviewPane(QWidget):
             self._set_checking(False)
             return
         rule_id = self._pending_check_ids.pop(0)
-        rule = self._rules_by_id[rule_id]
+        rule = self._session.rules[rule_id]
         self.status_label.setText(f"Checking {rule.name}…")
         self._set_checking(True)
         self._worker = CheckWorker(
-            rule, baseline_for_rule(self._state, rule_id), self._namespace_collisions, self
+            rule, self._session.baseline(rule_id), self._session.collisions, self
         )
         self._worker.progress.connect(self._on_check_progress)
         self._worker.check_finished.connect(self._on_check_finished)
@@ -423,14 +372,14 @@ class ReviewPane(QWidget):
         if cancelled:
             # Truncated: rendering it would under-report drift (even "in sync").
             return
-        current_rule = self._rules_by_id.get(result.rule_id)
+        current_rule = self._session.rules.get(result.rule_id)
         # Still set here: _worker is cleared on QThread.finished, queued after this.
         worker = self._worker
         if (
             current_rule is None
             or worker.rule != current_rule
             or collisions_for_rule(result.rule_id, worker.collisions)
-            != collisions_for_rule(result.rule_id, self._namespace_collisions)
+            != collisions_for_rule(result.rule_id, self._session.collisions)
         ):
             # The rule was deleted or edited (apply_config) mid-check, or
             # another rule's edit changed its collisions: this result
@@ -439,9 +388,8 @@ class ReviewPane(QWidget):
             if current_rule is not None and result.rule_id not in self._pending_check_ids:
                 self._pending_check_ids.append(result.rule_id)
             return
-        # Equal to the pane's for this rule (checked above). A fresh tree
-        # carries no unlocks, so a re-check re-blocks structurally (spec.md §8).
-        self._review[result.rule_id] = build_review_rule(result, collisions=worker.collisions)
+        # Equal to the session's for this rule (checked above).
+        self._session.record_check(result)
         self._refresh_rule_list()
         if result.rule_id == self._current_rule_id:
             self._show_rule(result.rule_id)
@@ -456,14 +404,13 @@ class ReviewPane(QWidget):
     # -- left pane -------------------------------------------------------
 
     def _rule_list_text(self, rule_id: str) -> str:
-        sync_rule = self._rules_by_id[rule_id]
-        review_rule = self._review.get(rule_id)
+        sync_rule = self._session.rules[rule_id]
         masters = ", ".join(master_basename(m.path) for m in sync_rule.masters)
-        if review_rule is None:
+        if self._session.tree(rule_id) is None:
             status = "not checked yet"
         else:
-            drift = _tally_text(rule_tally(review_rule))
-            n_blocked = blocked_master_count(review_rule)
+            drift = _tally_text(self._session.tally(rule_id))
+            n_blocked = self._session.blocked_count(rule_id)
             if n_blocked:
                 drift += f", {n_blocked} blocked"
             n_rep = len(sync_rule.replicas)
@@ -482,11 +429,11 @@ class ReviewPane(QWidget):
         with QSignalBlocker(self.rule_list):
             self.rule_list.clear()  # empties the list, so the refresh recreates rows
             self._refresh_rule_list()
-        ids = list(self._rules_by_id)  # also the row order
+        ids = list(self._session.rules)  # also the row order
         if not ids:
             self._on_rule_row_changed(-1)
             return
-        rule_id = preferred_rule_id if preferred_rule_id in self._rules_by_id else ids[0]
+        rule_id = preferred_rule_id if preferred_rule_id in self._session.rules else ids[0]
         if rule_id == preferred_rule_id and rule_id in unchanged:
             with QSignalBlocker(self.rule_list):
                 self.rule_list.setCurrentRow(ids.index(rule_id))  # tree is still accurate
@@ -498,11 +445,11 @@ class ReviewPane(QWidget):
         current row — and with it the right-pane tree — is left untouched."""
         if self.rule_list.count() == 0:
             with QSignalBlocker(self.rule_list):
-                for rule_id in self._rules_by_id:
+                for rule_id in self._session.rules:
                     item = QListWidgetItem()
                     item.setData(Qt.UserRole, rule_id)
                     self.rule_list.addItem(item)
-        for row, rule_id in enumerate(self._rules_by_id):
+        for row, rule_id in enumerate(self._session.rules):
             self.rule_list.item(row).setText(self._rule_list_text(rule_id))
 
     def _on_rule_row_changed(self, row: int) -> None:
@@ -516,15 +463,15 @@ class ReviewPane(QWidget):
     # -- right pane --------------------------------------------------------
 
     def _show_rule(self, rule_id: str) -> None:
-        if not self._rules_by_id[rule_id].replicas:
+        if not self._session.rules[rule_id].replicas:
             self._show_note("No replicas yet")
             return
-        review_rule = self._review.get(rule_id)
+        review_rule = self._session.tree(rule_id)
         if review_rule is None:
             self._show_unchecked(rule_id)
             return
         self._populate_tree(review_rule)
-        self._apply_selection_to_tree(self._selected[rule_id])
+        self._apply_selection_to_tree(rule_id)
         self._expand_drifted()
         self._refresh_bar()
 
@@ -546,7 +493,7 @@ class ReviewPane(QWidget):
         names-only walk on a worker thread. Checks stay on-demand."""
         self._show_note("Scanning masters…")
         # Parented to the pane, which keeps it alive until deleteLater.
-        worker = PreviewWorker(self._rules_by_id[rule_id], self)
+        worker = PreviewWorker(self._session.rules[rule_id], self)
         worker.preview_ready.connect(self._on_preview_ready)
         worker.preview_failed.connect(self._on_preview_failed)
         worker.finished.connect(worker.deleteLater)
@@ -555,7 +502,10 @@ class ReviewPane(QWidget):
     def _preview_is_stale(self, rule: SyncRule) -> bool:
         # The user moved on, or the rule changed, while it walked — or a check
         # landed first, and its tree is the truth.
-        return self._rules_by_id.get(self._current_rule_id) != rule or rule.id in self._review
+        return (
+            self._session.rules.get(self._current_rule_id) != rule
+            or self._session.tree(rule.id) is not None
+        )
 
     def _on_preview_failed(self, rule: SyncRule, message: str) -> None:
         if not self._preview_is_stale(rule):
@@ -564,12 +514,12 @@ class ReviewPane(QWidget):
     def _on_preview_ready(self, rule: SyncRule, layout: MasterLayout) -> None:
         if self._preview_is_stale(rule):
             return
-        preview = build_preview_rule(rule, layout, self._namespace_collisions)
+        preview = self._session.preview(rule, layout)
         self._populate_tree(preview, preview=True)
         self.tree.expandToDepth(0)
 
     def _collision_banner(self, rule_id: str, collision: NamespaceCollision) -> str:
-        others = other_rule_names(collision, rule_id, self._rules_by_id)
+        others = other_rule_names(collision, rule_id, self._session.rules)
         return (
             f"Also claimed by: {', '.join(others) or 'another rule'} — rename a master or "
             "stop sharing this replica to fix."
@@ -622,7 +572,7 @@ class ReviewPane(QWidget):
         return item
 
     def _replica_item_label(self, node: ReviewReplica) -> str:
-        label = replica_label(self._config, node.replica_path)
+        label = replica_label(self._session.config, node.replica_path)
         if not node.replica_exists:
             label += "  (missing — will be created)"
         return label
@@ -643,7 +593,7 @@ class ReviewPane(QWidget):
             yield item
             stack.extend(item.child(i) for i in range(item.childCount()))
 
-    def _apply_selection_to_tree(self, selected: frozenset[LeafKey]) -> None:
+    def _apply_selection_to_tree(self, rule_id: str) -> None:
         with QSignalBlocker(self.tree):
             for item in self._iter_tree_items():
                 node = item.data(0, ROLE_NODE)
@@ -652,7 +602,7 @@ class ReviewPane(QWidget):
                 # on one paints an indicator that can't be used.
                 if node is None or not item.flags() & Qt.ItemIsUserCheckable:
                     continue
-                item.setCheckState(0, _CHECK_STATE[node_state(node, selected)])
+                item.setCheckState(0, _CHECK_STATE[self._session.node_state(rule_id, node)])
 
     def _expand_drifted(self) -> None:
         for item in self._iter_tree_items():
@@ -667,22 +617,20 @@ class ReviewPane(QWidget):
         if node is None:
             return
         rule_id = self._current_rule_id
-        self._selected[rule_id] = toggle(node, self._selected[rule_id])
-        self._apply_selection_to_tree(self._selected[rule_id])
+        self._session.toggle(rule_id, node)
+        self._apply_selection_to_tree(rule_id)
         self._refresh_bar()
 
     # -- action bar --------------------------------------------------------
 
     def _refresh_bar(self) -> None:
-        current = self._current_review()
-        if current is None:
+        rule_id = self._checked_rule_id()
+        if rule_id is None:
             for button in (self.btn_sync_selected, self.btn_sync_all_safe, self.btn_resolve):
                 button.setEnabled(False)
             return
-        rule_id, review_rule = current
-        counts = rule_tally(review_rule)
-        selection = resolve_selection(review_rule, self._selected[rule_id])
-        n_selected = sum(map(len, selection.values()))
+        counts = self._session.tally(rule_id)
+        n_selected = self._session.selected_count(rule_id)
         self.btn_sync_selected.setText(f"Sync selected ({n_selected})")
         self.btn_sync_selected.setEnabled(n_selected > 0)
         self.btn_sync_all_safe.setText(f"Sync all safe changes ({counts['safe']})")
@@ -691,20 +639,20 @@ class ReviewPane(QWidget):
         self.btn_resolve.setEnabled(counts["conflict"] > 0)
 
     def _unlock_master(self, rule_id: str, landing_path: str) -> None:
-        self._review[rule_id] = self._review[rule_id].unlock(landing_path)
+        self._session.unlock(rule_id, landing_path)
         self._refresh_rule_list()
         self._show_rule(rule_id)
 
     def _request_conflict_resolution(self) -> None:
-        current = self._current_review()
-        if current is not None:
-            self._open_conflict_dialog(current[0])
+        rule_id = self._checked_rule_id()
+        if rule_id is not None:
+            self._open_conflict_dialog(rule_id)
 
     # -- conflict resolution (issue #7) -------------------------------------
 
     def _on_item_clicked(self, item: QTreeWidgetItem, column: int) -> None:
         # A pre-check preview offers no actions, however its rows look.
-        if column != 2 or self._current_review() is None:
+        if column != 2 or self._checked_rule_id() is None:
             return
         node = item.data(0, ROLE_NODE)
         if isinstance(node, ReviewLeaf) and node.resolvable:
@@ -715,31 +663,24 @@ class ReviewPane(QWidget):
     def _open_conflict_dialog(self, rule_id: str, replica_path: str | None = None) -> None:
         """Queues every conflict in the rule, or just one replica's when
         `replica_path` is given."""
-        review_rule = self._review.get(rule_id)
-        if review_rule is None:
-            return
-        nodes = [
-            r for r in review_rule.replicas if replica_path is None or r.replica_path == replica_path
-        ]
-        queue = conflict_queue(nodes)
+        queue = self._session.conflict_queue(rule_id, replica_path)
         if queue:
             self._run_conflict_dialog(rule_id, queue)
 
     def _run_conflict_dialog(self, rule_id: str, queue: list[ReviewLeaf]) -> None:
-        rule = self._rules_by_id[rule_id]
         dialog = ConflictDialog(
-            rule,
+            self._session.rules[rule_id],
             queue,
-            self._state,
-            self._state_path,
-            self._logs_dir,
-            self._config,
+            self._session.state,
+            self._session.layout.state_path,
+            self._session.layout.logs_dir,
+            self._session.config,
             self,
         )
         dialog.exec()
         if not dialog.resolved_any:
             return  # closed or skipped through — nothing on disk changed
-        self._state = dialog.state
+        self._session.replace_state(dialog.state)
         self._queue_check(rule_id)
 
     def _show_tree_context_menu(self, pos) -> None:
@@ -753,12 +694,13 @@ class ReviewPane(QWidget):
         # Bind the path, not the node: a lambda closing over `node` would pin
         # this whole replica subtree alive for as long as the menu's actions.
         replica_path = node.replica_path
-        by_category = bulk_candidates_by_category([node])
+        by_category = self._session.bulk_candidates(rule_id, replica_path)
         menu = QMenu(self)
         # Deleted with the menu rather than living on as a child of the pane.
         menu.setAttribute(Qt.WA_DeleteOnClose)
-        # Per-replica queue entry point (spec.md §9).
-        n_conflicts = len(conflict_queue([node]))
+        # Per-replica queue entry point (spec.md §9). Counted from the pools
+        # already in hand — they are the same conflict queue, grouped.
+        n_conflicts = sum(map(len, by_category.values()))
         if n_conflicts:
             action = menu.addAction(f"Resolve conflicts ({n_conflicts})")
             action.triggered.connect(
@@ -784,11 +726,8 @@ class ReviewPane(QWidget):
         menu.exec(self.tree.viewport().mapToGlobal(pos))
 
     def _bulk_keep(self, rule_id: str, replica_path: str, changes) -> None:
-        rule = self._rules_by_id[rule_id]
         try:
-            self._state = apply_keep_replica(
-                rule, {replica_path: changes}, self._state, self._state_path
-            )
+            self._session.keep(rule_id, {replica_path: changes})
         except OSError as exc:
             # Nothing is merged or saved unless every file could be read.
             QMessageBox.warning(self, "Couldn't keep replica versions", str(exc))
@@ -796,28 +735,24 @@ class ReviewPane(QWidget):
         self._queue_check(rule_id)
 
     def _bulk_overwrite(self, rule_id: str, replica_path: str, changes) -> None:
-        rule = self._rules_by_id[rule_id]
-        result = bulk_overwrite(
-            self, rule, {replica_path: changes}, self._state, self._state_path, self._logs_dir
-        )
-        if result is None:
+        changes_by_replica = {replica_path: changes}
+        if not confirm_bulk_overwrite(self, changes_by_replica):
             return  # cancelled at the confirm prompt — nothing applied
-        self._state = result.state
+        result = self._session.overwrite(rule_id, changes_by_replica)
+        if result.errors:
+            QMessageBox.warning(self, "Finished with errors", _error_detail(result.errors))
         self._queue_check(rule_id)
 
     def _sync_all_safe(self) -> None:
-        current = self._current_review()
-        if current is not None:
-            rule_id, review_rule = current
-            self._apply_changes(rule_id, sync_all_safe_changes(review_rule))
+        rule_id = self._checked_rule_id()
+        if rule_id is not None:
+            self._report_sync(rule_id, self._session.sync_all_safe(rule_id))
 
     def _sync_selected(self) -> None:
-        current = self._current_review()
-        if current is None:
+        rule_id = self._checked_rule_id()
+        if rule_id is None:
             return
-        rule_id, review_rule = current
-        selected = self._selected[rule_id]
-        delete_changes = selection_by_bucket(review_rule, selected, "delete")
+        delete_changes = self._session.pending_deletions(rule_id)
         if delete_changes:
             lines = [
                 f"{path}: {change.rel_path}"
@@ -842,24 +777,19 @@ class ReviewPane(QWidget):
                 return
         # sync() orders copies before deletions itself (sync.py), so the
         # safe and delete picks need no separate batching here.
-        self._apply_changes(rule_id, resolve_selection(review_rule, selected))
+        self._report_sync(rule_id, self._session.sync_selected(rule_id))
 
-    def _apply_changes(self, rule_id: str, applied_changes: dict) -> None:
-        if not applied_changes:
+    def _report_sync(self, rule_id: str, result) -> None:
+        """Tells the user how a sync went, then re-checks. `result` is None
+        when the session had nothing to apply, which needs neither."""
+        if result is None:
             return
-        sync_rule = self._rules_by_id[rule_id]
-        result = run_sync(
-            sync_rule, applied_changes, self._state, self._state_path, self._logs_dir
-        )
-        self._state = result.state
-        self._selected[rule_id] = frozenset()
         if result.errors:
-            detail = "\n".join(f"{e.rel_path}: {e.message}" for e in result.errors)
             QMessageBox.warning(
                 self,
                 "Sync finished with errors",
                 f"Copied {result.copied}, deleted {result.deleted}, "
-                f"{len(result.errors)} error(s):\n\n{detail}",
+                f"{len(result.errors)} error(s):\n\n{_error_detail(result.errors)}",
             )
         else:
             QMessageBox.information(

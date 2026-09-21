@@ -35,6 +35,7 @@ from syncer.config import (
 from syncer.gui.review_pane import ReviewPane
 from syncer.gui.rule_dialog import RuleDialog
 from syncer.gui.update_dialog import UpdateDialog
+from syncer.session import Session
 from syncer.state import State, reconcile_and_save
 from syncer.storage import StorageLayout, SyncerError
 from syncer.update_apply import PreparedUpdate, install_update
@@ -58,7 +59,7 @@ class _EmptyStateWidget(QWidget):
 
 class MainWindow(QMainWindow):
     """`state` must already be reconciled against `config` (app.py does so via
-    `reconcile_and_save`). From then on `review_pane` owns the in-memory state.
+    `reconcile_and_save`). From then on the `Session` owns the in-memory state.
     """
 
     def __init__(
@@ -75,9 +76,10 @@ class MainWindow(QMainWindow):
         self.resize(1100, 720)
         self._storage = layout
         self._config_store = config_store
-        self._config = config
-
-        self.review_pane = ReviewPane(config, state, layout.state_path, layout.logs_dir, self)
+        # The Session owns the live config too, so the window keeps no second
+        # copy that an interrupted _adopt_config could leave out of step.
+        self._session = Session(layout, config, state)
+        self.review_pane = ReviewPane(self._session, self)
         self._empty_state = _EmptyStateWidget(self._add_rule, self)
 
         self._stack = QStackedWidget()
@@ -132,12 +134,14 @@ class MainWindow(QMainWindow):
         self.action_check.setEnabled(has_selection)
 
     def _refresh_view(self) -> None:
-        self._stack.setCurrentWidget(self._empty_state if not self._config.rules else self.review_pane)
+        self._stack.setCurrentWidget(
+            self._empty_state if not self._session.rules else self.review_pane
+        )
         self._refresh_toolbar_state()
 
     def _selected_rule(self) -> SyncRule | None:
         rule_id = self.review_pane.current_rule_id
-        return next((rule for rule in self._config.rules if rule.id == rule_id), None)
+        return self._session.rules.get(rule_id) if rule_id else None
 
     def _show_rule_context_menu(self, pos) -> None:
         item = self.review_pane.rule_list.itemAt(pos)
@@ -156,7 +160,7 @@ class MainWindow(QMainWindow):
     def _run_rule_dialog(self, existing_rule: SyncRule | None) -> Config | None:
         """The config a save of the dialog's rule and replica names would
         produce, or None if it was cancelled."""
-        dialog = RuleDialog(self._config, existing_rule, self)
+        dialog = RuleDialog(self._session.config, existing_rule, self)
         try:
             return dialog.result_config if dialog.exec() == RuleDialog.Accepted else None
         finally:
@@ -188,7 +192,7 @@ class MainWindow(QMainWindow):
             QMessageBox.No,
         )
         if confirm == QMessageBox.Yes:
-            self._save_and_adopt(without_rule(self._config, rule.id))
+            self._save_and_adopt(without_rule(self._session.config, rule.id))
 
     def _check_selected_rule(self) -> None:
         rule_id = self.review_pane.current_rule_id
@@ -263,7 +267,6 @@ class MainWindow(QMainWindow):
         reload alike (spec.md §10): purge state.json of anything no longer
         configured, then hand the new rules and state to the review pane.
         """
-        self._config = config
-        state = reconcile_and_save(self._storage.state_path, self.review_pane.state, config)
+        state = reconcile_and_save(self._storage.state_path, self._session.state, config)
         self.review_pane.apply_config(config, state)
         self._refresh_view()

@@ -32,10 +32,9 @@ from syncer.conflict import (
     FileMeta,
     apply_keep_replica,
     build_conflict_view,
-    changes_by_replica,
     summarize_overwrite,
 )
-from syncer.review import CATEGORY_LABEL, ReviewLeaf
+from syncer.review import CATEGORY_LABEL, ReviewLeaf, changes_by_replica
 from syncer.state import State
 from syncer.sync import SyncResult
 from syncer.sync import sync as run_sync
@@ -311,7 +310,16 @@ def _confirm_deletion(parent, rel_path: str) -> bool:
     return box.clickedButton() is confirm
 
 
-def confirm_bulk_overwrite(parent, changes: list[FileChange], replica_count: int) -> bool:
+def confirm_bulk_overwrite(parent, by_replica: dict[str, list[FileChange]]) -> bool:
+    """Takes the same `{replica_path: [FileChange]}` shape the apply half does
+    (`sync()`, `Session.overwrite`), and derives the file and replica counts
+    itself so no caller has to restate them. Named `by_replica` rather than
+    `changes_by_replica` so it can't shadow the helper of that name this
+    module imports."""
+    changes = [change for group in by_replica.values() for change in group]
+    if not changes:
+        return False  # nothing to confirm, and nothing to apply
+    replica_count = sum(1 for group in by_replica.values() if group)
     n = len(changes)
     summary = summarize_overwrite(changes)
     box = QMessageBox(QMessageBox.Question, "Overwrite from master", "", parent=parent)
@@ -338,7 +346,7 @@ def confirm_bulk_overwrite(parent, changes: list[FileChange], replica_count: int
 def bulk_overwrite(
     parent,
     rule: SyncRule,
-    changes_by_replica: dict[str, list[FileChange]],
+    by_replica: dict[str, list[FileChange]],
     state: State,
     state_path: Path,
     logs_dir: Path,
@@ -350,11 +358,9 @@ def bulk_overwrite(
     Returns `None` when the user cancels, so "cancelled" stays distinct from
     "applied, and the state happens to be unchanged".
     """
-    changes = [change for group in changes_by_replica.values() for change in group]
-    replica_count = sum(1 for group in changes_by_replica.values() if group)
-    if not changes or not confirm_bulk_overwrite(parent, changes, replica_count):
+    if not confirm_bulk_overwrite(parent, by_replica):
         return None
-    result = run_sync(rule, changes_by_replica, state, state_path, logs_dir)
+    result = run_sync(rule, by_replica, state, state_path, logs_dir)
     if result.errors:
         detail = "\n".join(f"{e.rel_path}: {e.message}" for e in result.errors)
         QMessageBox.warning(parent, "Finished with errors", detail)

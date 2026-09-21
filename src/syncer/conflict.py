@@ -28,9 +28,6 @@ from syncer.review import (
     ReviewLeaf,
     ReviewNode,
     ReviewReplica,
-    # Lives in review.py beside `iter_leaves`/`ReviewLeaf`; re-exported here
-    # because the conflict dialog and its bulk actions are its callers.
-    changes_by_replica,
     iter_leaves,
 )
 from syncer.state import State, merge_replica_entries, save_state

@@ -9,11 +9,10 @@ from syncer.conflict import (
     apply_keep_replica,
     build_conflict_view,
     bulk_candidates_by_category,
-    changes_by_replica,
     conflict_queue,
     summarize_overwrite,
 )
-from syncer.review import ReviewLeaf, ReviewReplica
+from syncer.review import ReviewLeaf, ReviewReplica, changes_by_replica
 from syncer.state import ReplicaState, State, load_state
 
 EMPTY_STATE = State(version=1, hash_algo="sha256", rules={})
