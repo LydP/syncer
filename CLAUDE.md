@@ -31,7 +31,7 @@ a ~250MB download.
 
 | Path | What |
 |------|------|
-| `src/syncer/` | Application source, src-layout. `storage.py` resolves `base_dir`, checks writability, and provisions the storage layout — see ADR 0001. `config.py` loads/saves/validates `config.toml`: `SyncRule.masters` (a list of `Master{path, type}` — multi-master, multi-replica per rule), `load_config`/`save_config`, uniqueness validation (duplicate master basename/path within a rule, duplicate rule name across rules), atomic writes with rolling backups, and `ConfigStore` for reload / warn-before-clobber. |
+| `src/syncer/` | Application source, src-layout. `storage.py` resolves `base_dir`, checks writability, and provisions the storage layout — see ADR 0001. `landing.py` is the landing-path arithmetic (`LandingMap`: `owns`/`master_abs`/`split`, plus `replica_abs_path` and the basename keys) — see CONTEXT.md's **Landing path**. `config.py` loads/saves/validates `config.toml`: `SyncRule.masters` (a list of `Master{path, type}` — multi-master, multi-replica per rule), `load_config`/`save_config`, uniqueness validation (duplicate master basename/path within a rule, duplicate rule name across rules), atomic writes with rolling backups, and `ConfigStore` for reload / warn-before-clobber. |
 | `tests/` | Pytest suite, one `test_<module>.py` per `src/syncer/<module>.py`. |
 | `scripts/` | Build/release tooling, not shipped with the app. `build.py` drives the Nuitka standalone build and embeds the version from `pyproject.toml` — see ADR 0003. Needs the `gui` and `build` extras: `pip install -e ".[gui,build]"`. |
 | `CONTEXT.md` | Domain glossary — the authoritative vocabulary. Read first. |
@@ -43,7 +43,9 @@ a ~250MB download.
 ## Architecture
 
 **Module dependency chain** (each layer imports only from the ones before it):
-`storage.py` → `config.py` (config.toml) + `check.py` (drift detection) → `state.py` (state.json,
+`storage.py` → `landing.py` (landing-path arithmetic; imports `Master` only under `TYPE_CHECKING`,
+since `config.py` calls its basename helpers) → `config.py` (config.toml) + `check.py` (drift
+detection) → `state.py` (state.json,
 imports `check.BaselineEntry`) → `sync.py` (executor) + `conflict.py` (resolution) → `review.py`
 (tree/bucketing model) → `session.py` (the live working set, ADR 0005) → `gui/` (Qt).
 `conflict.py` imports from `review.py`, and `session.py` from both; `gui/` reaches the workflow only

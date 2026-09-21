@@ -46,8 +46,9 @@ from syncer.check import (
     other_rule_names,
     scan_master_layout,
 )
-from syncer.config import SyncRule, master_basename, replica_label
+from syncer.config import SyncRule, replica_label
 from syncer.gui.conflict_dialog import ConflictDialog, bulk_overwrite, error_detail
+from syncer.landing import master_basename
 from syncer.review import (
     CATEGORY_LABEL,
     CONFLICT_CATEGORIES,

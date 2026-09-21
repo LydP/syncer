@@ -26,15 +26,8 @@ from syncer.check import (
     ReplicaCheckResult,
     collisions_for_rule,
 )
-from syncer.config import (
-    Master,
-    SyncRule,
-    master_basename,
-    master_basename_key,
-    masters_by_basename_key,
-    normalize_replica_path,
-    split_landing_path,
-)
+from syncer.config import Master, SyncRule, normalize_replica_path
+from syncer.landing import LandingMap, master_basename, master_basename_key
 
 # category -> action bucket, spec.md §5's taxonomy table / §7's three
 # categories. "context" rows are shown (greyed) but never checkable.
@@ -262,7 +255,7 @@ def _build_master(
     replica_path: str,
 ) -> ReviewMaster:
     """`files` are `(change, rest)` pairs, `rest` being the rel_path below the
-    landing path (`split_landing_path`'s remainder) — empty for a file
+    landing path (`LandingMap.split`'s remainder) — empty for a file
     master's one file, which lands directly under the master node."""
     root: list[ReviewNode] = []
     folders: dict[str, ReviewFolder] = {}
@@ -294,40 +287,39 @@ def _build_master(
 
 
 def _group_by_master(
-    files: list[FileChange], masters_by_key: dict[str, Master]
-) -> dict[str, list[tuple[FileChange, str]]]:
-    """`files` bucketed by the basename key of the master whose landing path
-    starts each `rel_path` — always exactly one, since check() only ever
-    reports rel_paths owned by a configured, non-collided master of this rule
-    (config.is_owned_landing_path) — each paired with its remainder below
-    that landing path. Reuses config.split_landing_path so the head-matching
-    stays identical to is_owned_landing_path/master_abs_path's — and its
-    `key`, rather than re-deriving the same string from `master.path` once
-    per change.
+    files: list[FileChange], landing: LandingMap
+) -> dict[Master, list[tuple[FileChange, str]]]:
+    """`files` bucketed by the master whose landing path starts each
+    `rel_path` — always exactly one, since check() only ever reports
+    rel_paths owned by a configured, non-collided master of this rule
+    (`LandingMap.owns`) — each paired with its remainder below that landing
+    path. Reuses `LandingMap.split` so the head-matching stays identical to
+    `owns`/`master_abs`'s.
     """
-    grouped: dict[str, list[tuple[FileChange, str]]] = {key: [] for key in masters_by_key}
+    grouped: dict[Master, list[tuple[FileChange, str]]] = {master: [] for master in landing.masters}
     for change in files:
-        split = split_landing_path(masters_by_key, change.rel_path)
+        split = landing.split(change.rel_path)
         if split.master is not None:
-            grouped[split.key].append((change, split.rest))
+            grouped[split.master].append((change, split.rest))
     return grouped
 
 
 def _build_replica(
     replica_result: ReplicaCheckResult,
     masters: list[MasterStatus],
-    masters_by_key: dict[str, Master],
+    landing: LandingMap,
     collided: dict[tuple[str, str], NamespaceCollision],
 ) -> ReviewReplica:
-    grouped = _group_by_master(replica_result.files, masters_by_key)
+    grouped = _group_by_master(replica_result.files, landing)
     master_nodes = []
     for status in masters:
-        key = master_basename_key(status.master.path)
         master_nodes.append(
             _build_master(
                 status,
-                collided.get((replica_result.replica_path, key)),
-                grouped[key],
+                collided.get(
+                    (replica_result.replica_path, master_basename_key(status.master.path))
+                ),
+                grouped[status.master],
                 replica_result.replica_path,
             )
         )
@@ -510,12 +502,12 @@ def build_review_rule(
     through for every rule it builds.
     """
     collided = collisions_for_rule(check_result.rule_id, collisions)
-    masters_by_key = masters_by_basename_key([status.master for status in check_result.masters])
+    landing = LandingMap([status.master for status in check_result.masters])
     return ReviewRule(
         rule_id=check_result.rule_id,
         rule_name=check_result.rule_name,
         replicas=[
-            _build_replica(r, check_result.masters, masters_by_key, collided)
+            _build_replica(r, check_result.masters, landing, collided)
             for r in check_result.replicas
         ],
     )

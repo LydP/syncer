@@ -6,14 +6,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from syncer.check import BaselineEntry, FileChange, baseline_from_disk
-from syncer.config import (
-    Master,
-    SyncRule,
-    master_abs_path,
-    masters_by_basename_key,
-    normalize_replica_path,
-    replica_abs_path,
-)
+from syncer.config import SyncRule, normalize_replica_path
+from syncer.landing import LandingMap, replica_abs_path
 from syncer.state import State, merge_replica_entries, save_state
 from syncer.storage import atomic_copy, make_writable, utc_file_stamp
 
@@ -34,10 +28,8 @@ class SyncResult:
     errors: list[FileError]
 
 
-def _copy_change(
-    masters_by_key: dict[str, Master], replica_root: str, change: FileChange
-) -> BaselineEntry:
-    master_abs = master_abs_path(masters_by_key, change.rel_path)
+def _copy_change(landing: LandingMap, replica_root: str, change: FileChange) -> BaselineEntry:
+    master_abs = landing.master_abs(change.rel_path)
     replica_abs = replica_abs_path(replica_root, change.rel_path)
     if change.category == "new":
         os.makedirs(os.path.dirname(replica_abs), exist_ok=True)
@@ -85,7 +77,7 @@ def sync(
     cancel=None,
 ) -> SyncResult:
     started = time.monotonic()
-    masters_by_key = masters_by_basename_key(rule.masters)
+    landing = LandingMap(rule.masters)
     ordered = [
         (replica, key, applied_changes[key])
         for replica in rule.replicas
@@ -117,9 +109,7 @@ def sync(
                     _delete_change(replica, replica_key, change.rel_path)
                     removed_paths.append(change.rel_path)
                 else:
-                    baseline_updates[change.rel_path] = _copy_change(
-                        masters_by_key, replica, change
-                    )
+                    baseline_updates[change.rel_path] = _copy_change(landing, replica, change)
             except OSError as exc:
                 errors.append(FileError(change.rel_path, str(exc)))
                 log_lines.append(_log_line(action, "error", change.rel_path, str(exc)))

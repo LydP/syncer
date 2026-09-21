@@ -5,10 +5,10 @@ import tomllib
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import NamedTuple
 
 import tomli_w
 
+from syncer.landing import master_basename, master_basename_key
 from syncer.storage import SyncerError, atomic_write_bytes, utc_file_stamp
 
 MAX_CONFIG_BACKUPS = 10
@@ -51,17 +51,6 @@ def normalize_replica_path(path: str) -> str:
     return os.path.normcase(os.path.normpath(os.path.abspath(path)))
 
 
-def master_basename(path: str) -> str:
-    return os.path.basename(os.path.normpath(path))
-
-
-def master_basename_key(path: str) -> str:
-    """A master's basename identity: what must be unique within a rule, and
-    what two rules' masters collide on inside a shared replica.
-    """
-    return os.path.normcase(master_basename(path))
-
-
 def default_rule_name(master: str, master_type: str) -> str:
     """The add-rule modal's pre-filled name: the master's basename, extension
     stripped for a file (a folder's basename has no extension to strip).
@@ -70,14 +59,6 @@ def default_rule_name(master: str, master_type: str) -> str:
     if master_type == "file":
         return os.path.splitext(basename)[0]
     return basename
-
-
-def replica_abs_path(replica_root: str, rel_path: str) -> str:
-    """The on-disk path of a replica-relative `rel_path` — replicas are
-    always a namespaced landing tree, so it's a plain join. Shared by sync.py
-    and conflict.py so this rule has a single owner.
-    """
-    return os.path.join(replica_root, *rel_path.split("/"))
 
 
 @dataclass(frozen=True)
@@ -106,64 +87,6 @@ class Config:
     version: int
     rules: list[SyncRule] = field(default_factory=list)
     replica_names: list[ReplicaName] = field(default_factory=list)
-
-
-def masters_by_basename_key(masters: list[Master]) -> dict[str, Master]:
-    return {master_basename_key(master.path): master for master in masters}
-
-
-def is_owned_landing_path(masters_by_key: dict[str, Master], rel_path: str) -> bool:
-    """Whether `rel_path` — a replica-relative landing path, matched
-    case-insensitively — falls in the namespace of one of `masters_by_key`
-    (config data only, independent of what's on disk): a file master's bare
-    filename, or a dir master's landing folder itself or anything under it.
-    The landing folder's own path stays owned so a file or junction sitting
-    where that folder belongs is reported as a type mismatch / unreadable,
-    not silently dropped. A landing path no *currently configured* master
-    claims is left over from a master since removed from the rule, which
-    check() reconciles away silently (issue #21) and reconcile_with_config
-    purges from the baseline (issue #22).
-    """
-    split = split_landing_path(masters_by_key, rel_path)
-    return split.master is not None and (split.master.type == "dir" or not split.nested)
-
-
-def master_abs_path(masters_by_key: dict[str, Master], rel_path: str) -> str:
-    """The master-side file behind a namespaced replica-relative `rel_path` —
-    the inverse of the landing-path namespacing `is_owned_landing_path`
-    checks — for sync.py/conflict.py to resolve a FileChange back to
-    master-side bytes. A file master's landing path is its bare filename, so
-    it maps straight to the master itself.
-    """
-    master, nested, rest, _ = split_landing_path(masters_by_key, rel_path)
-    if master is not None:
-        if master.type == "dir" and nested:
-            return os.path.join(master.path, *rest.split("/"))
-        if master.type == "file" and not nested:
-            return master.path
-    raise ValueError(f"{rel_path!r} is not a file landing path of any configured master")
-
-
-class LandingSplit(NamedTuple):
-    """`split_landing_path`'s result. `key` is the normcased head — the same
-    basename key `masters_by_basename_key` is keyed on — exposed so a caller
-    grouping by master doesn't have to re-derive it from `master.path`.
-    """
-
-    master: Master | None
-    nested: bool
-    rest: str
-    key: str
-
-
-def split_landing_path(masters_by_key: dict[str, Master], rel_path: str) -> LandingSplit:
-    """`rel_path` split at its first separator: the master its head names
-    (matched case-insensitively), whether anything follows the head, that
-    remainder with its casing intact, and the normcased head itself.
-    """
-    head, sep, rest = rel_path.replace("\\", "/").partition("/")
-    key = os.path.normcase(head)
-    return LandingSplit(masters_by_key.get(key), bool(sep), rest, key)
 
 
 def _rule_name_key(name: str) -> str:

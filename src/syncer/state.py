@@ -6,12 +6,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from syncer.check import HASH_ALGO, BaselineEntry
-from syncer.config import (
-    Config,
-    is_owned_landing_path,
-    masters_by_basename_key,
-    normalize_replica_path,
-)
+from syncer.config import Config, normalize_replica_path
+from syncer.landing import LandingMap
 from syncer.storage import atomic_write_bytes, utc_file_stamp
 
 STATE_VERSION = 1
@@ -185,7 +181,7 @@ def reconcile_with_config(state: State, config: Config) -> State:
     configured = {
         rule.id: (
             {normalize_replica_path(replica) for replica in rule.replicas},
-            masters_by_basename_key(rule.masters),
+            LandingMap(rule.masters),
         )
         for rule in config.rules
     }
@@ -193,7 +189,7 @@ def reconcile_with_config(state: State, config: Config) -> State:
     for rule_id, replicas in state.rules.items():
         if rule_id not in configured:
             continue
-        replica_paths, masters_by_key = configured[rule_id]
+        replica_paths, landing = configured[rule_id]
         kept = {}
         for p, r in replicas.items():
             if p not in replica_paths:
@@ -201,7 +197,7 @@ def reconcile_with_config(state: State, config: Config) -> State:
             files = {
                 rel_path: entry
                 for rel_path, entry in r.files.items()
-                if is_owned_landing_path(masters_by_key, rel_path)
+                if landing.owns(rel_path)
             }
             # Reuse the existing ReplicaState when nothing was purged, so
             # reconcile_and_save's `reconciled != state` can settle on identity

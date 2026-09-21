@@ -5,15 +5,8 @@ import re
 import stat
 from dataclasses import dataclass, field, replace
 
-from syncer.config import (
-    Master,
-    SyncRule,
-    is_owned_landing_path,
-    master_basename,
-    master_basename_key,
-    masters_by_basename_key,
-    normalize_replica_path,
-)
+from syncer.config import Master, SyncRule, normalize_replica_path
+from syncer.landing import LandingMap, master_basename, master_basename_key
 
 _IGNORED_DIR_NAMES = {".git", ".svn", ".hg", "__pycache__"}
 # "*.syncer-tmp-*": the executor's own overwrite temp files, orphaned only by a
@@ -324,11 +317,11 @@ def _comparable_keys(side: _Side) -> set[str]:
     return {key for key, entry in side.entries.items() if entry.kind != "dir"}
 
 
-def _replica_error_in_scope(replica: str, error_path: str, masters_by_key: dict[str, Master]) -> bool:
+def _replica_error_in_scope(replica: str, error_path: str, landing: LandingMap) -> bool:
     if not error_path:
         return True
     rel_path = os.path.relpath(error_path, replica)
-    return rel_path == "." or is_owned_landing_path(masters_by_key, rel_path)
+    return rel_path == "." or landing.owns(rel_path)
 
 
 def _entry_hash(
@@ -588,7 +581,6 @@ def check(
     master_side, master_statuses = _scan_masters(rule.masters)
     master_keys = _comparable_keys(master_side)
     master_hashes: dict[str, str] = {}
-    masters_by_key = masters_by_basename_key(rule.masters)
 
     # Basenames this rule must not report on in a given replica: a collision
     # with another rule sharing that replica (CONTEXT.md's Cross-rule
@@ -603,7 +595,9 @@ def check(
         baseline_by_key = {os.path.normcase(p): p for p in replica_baseline}
         side = _scan_side(replica, "dir")
         # A collided master is out of scope here as if it weren't in the rule.
-        in_scope = {k: m for k, m in masters_by_key.items() if (replica_key, k) not in collided}
+        in_scope = LandingMap(
+            [m for m in rule.masters if (replica_key, master_basename_key(m.path)) not in collided]
+        )
         # The replica is walked whole, but it may hold other rules' landing
         # paths or unrelated content: keep only listing errors at its root or
         # inside a landing path this rule owns here.
@@ -622,7 +616,7 @@ def check(
                 side=side,
                 baseline=replica_baseline,
                 baseline_by_key=baseline_by_key,
-                keys=sorted(k for k in candidate_keys if is_owned_landing_path(in_scope, k)),
+                keys=sorted(k for k in candidate_keys if in_scope.owns(k)),
             )
         )
 
@@ -670,7 +664,7 @@ def find_namespace_collisions(rules: list[SyncRule]) -> list[NamespaceCollision]
             replica_key = normalize_replica_path(replica)
             for basename in basenames:
                 slot = slots.setdefault(
-                    (replica_key, os.path.normcase(basename)),
+                    (replica_key, master_basename_key(basename)),
                     NamespaceCollision(replica_path=replica_key, landing_path=basename, rule_ids=[]),
                 )
                 if rule.id not in slot.rule_ids:

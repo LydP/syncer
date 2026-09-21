@@ -51,7 +51,6 @@ from syncer.config import (
     find_name_conflict,
     find_replica_name_conflict,
     find_replica_sharers,
-    master_basename_key,
     native_path,
     normalize_replica_path,
     replica_label,
@@ -59,6 +58,7 @@ from syncer.config import (
     with_replica_name,
     with_rule,
 )
+from syncer.landing import master_basename_key
 from syncer.storage import BaseDirNotWritableError, ensure_base_dir_writable
 
 _ERROR_COLOR = "#b3261e"

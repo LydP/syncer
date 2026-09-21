@@ -16,13 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from syncer.check import FileChange, baseline_from_disk, hash_file
-from syncer.config import (
-    SyncRule,
-    master_abs_path,
-    masters_by_basename_key,
-    normalize_replica_path,
-    replica_abs_path,
-)
+from syncer.config import SyncRule, normalize_replica_path
+from syncer.landing import LandingMap, replica_abs_path
 from syncer.review import (
     CONFLICT_CATEGORIES,
     ReviewLeaf,
@@ -243,7 +238,7 @@ def apply_keep_replica(
     mapping returns `state` untouched, so callers needn't guard: merging
     nothing would still bump `last_sync`.
     """
-    masters_by_key = masters_by_basename_key(rule.masters)
+    landing = LandingMap(rule.masters)
     # Replicas of one rule share masters, so each master file is hashed once.
     master_hashes: dict[str, str | None] = {}
     updates_by_replica = {}
@@ -252,7 +247,7 @@ def apply_keep_replica(
             continue
         updates = {}
         for change in changes:
-            master_abs = master_abs_path(masters_by_key, change.rel_path)
+            master_abs = landing.master_abs(change.rel_path)
             if master_abs not in master_hashes:
                 master_hashes[master_abs] = (
                     hash_file(master_abs) if os.path.isfile(master_abs) else None
@@ -276,7 +271,7 @@ def apply_keep_replica(
 
 
 def build_conflict_view(rule: SyncRule, replica_root: str, change: FileChange) -> ConflictView:
-    master_abs = master_abs_path(masters_by_basename_key(rule.masters), change.rel_path)
+    master_abs = LandingMap(rule.masters).master_abs(change.rel_path)
     replica_abs = replica_abs_path(replica_root, change.rel_path)
 
     if change.category == "both_changed":
