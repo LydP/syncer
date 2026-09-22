@@ -43,11 +43,11 @@ def native_path(path: str) -> str:
     """`path` with `/` turned into `\\` — the stored form, so Qt's `/`-form
     paths and typed `\\`-form ones never mix. Casing, a UNC prefix and a
     trailing separator stay as entered, unlike the lossy
-    `normalize_replica_path` dedupe key."""
+    `path_key` dedupe key."""
     return path.replace("/", os.sep)
 
 
-def normalize_replica_path(path: str) -> str:
+def path_key(path: str) -> str:
     return os.path.normcase(os.path.normpath(os.path.abspath(path)))
 
 
@@ -124,13 +124,13 @@ def find_master_conflict(masters: list[Master], index: int) -> tuple[str, Master
     returned — a path duplicate anywhere outranks an earlier basename one.
     """
     candidate = masters[index]
-    target_path = normalize_replica_path(candidate.path)
+    target_path = path_key(candidate.path)
     target_basename = master_basename_key(candidate.path)
     basename_match: Master | None = None
     for other_index, other in enumerate(masters):
         if other_index == index:
             continue
-        if normalize_replica_path(other.path) == target_path:
+        if path_key(other.path) == target_path:
             return ("path", other)
         if basename_match is None and master_basename_key(other.path) == target_basename:
             basename_match = other
@@ -164,22 +164,22 @@ def find_replica_sharers(
     Informational only — ADR 0002 makes replicas shareable across rules — for
     the add/edit-rule modal's "also used by" badge, not an error.
     """
-    target = normalize_replica_path(path)
+    target = path_key(path)
     return [
         rule
         for rule in config.rules
         if rule.id != exclude_rule_id
-        and any(normalize_replica_path(replica) == target for replica in rule.replicas)
+        and any(path_key(replica) == target for replica in rule.replicas)
     ]
 
 
 def replica_name(config: Config, path: str) -> str | None:
     """The name given to the replica at `path`, or None if it has none. Matched
-    on `normalize_replica_path`, so `/`, `\\` and casing differences still find
+    on `path_key`, so `/`, `\\` and casing differences still find
     the one replica."""
-    target = normalize_replica_path(path)
+    target = path_key(path)
     for replica in config.replica_names:
-        if normalize_replica_path(replica.path) == target:
+        if path_key(replica.path) == target:
             return replica.name
     return None
 
@@ -194,11 +194,11 @@ def find_replica_name_conflict(config: Config, path: str, name: str) -> ReplicaN
     is never its own conflict.
     """
     target = _replica_name_key(name)
-    path_key = normalize_replica_path(path)
+    own_key = path_key(path)
     for replica in _tidy_replica_names(config).replica_names:
         if (
             _replica_name_key(replica.name) == target
-            and normalize_replica_path(replica.path) != path_key
+            and path_key(replica.path) != own_key
         ):
             return replica
     return None
@@ -208,12 +208,12 @@ def with_replica_name(config: Config, path: str, name: str) -> Config:
     """`config` with the replica at `path` named `name` — added, or renamed in
     place — or, for a blank `name`, left with no name. `with_rule`'s sibling: the
     one definition of what naming a replica produces."""
-    key = normalize_replica_path(path)
+    key = path_key(path)
     name = name.strip()
     replica_names: list[ReplicaName] = []
     found = False
     for replica in config.replica_names:
-        if normalize_replica_path(replica.path) != key:
+        if path_key(replica.path) != key:
             replica_names.append(replica)
         elif name:
             replica_names.append(replace(replica, name=name))  # keeps its stored path spelling
@@ -310,7 +310,7 @@ def _validate_rules(rules: list[SyncRule]) -> None:
             master_paths,
             DuplicateMasterPathError,
             "master path used by more than one master in the same rule",
-            key=normalize_replica_path,
+            key=path_key,
         )
         _reject_duplicates(
             master_paths,
@@ -327,7 +327,7 @@ def _validate_rules(rules: list[SyncRule]) -> None:
 
 
 def _replica_keys_in_use(config: Config) -> set[str]:
-    return {normalize_replica_path(r) for rule in config.rules for r in rule.replicas}
+    return {path_key(r) for rule in config.rules for r in rule.replicas}
 
 
 def _tidy_replica_names(config: Config) -> Config:
@@ -339,7 +339,7 @@ def _tidy_replica_names(config: Config) -> Config:
         replica_names=[
             replace(replica, name=name)
             for replica in config.replica_names
-            if (name := replica.name.strip()) and normalize_replica_path(replica.path) in in_use
+            if (name := replica.name.strip()) and path_key(replica.path) in in_use
         ],
     )
 

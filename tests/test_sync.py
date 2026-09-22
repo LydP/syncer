@@ -2,7 +2,7 @@ import os
 import shutil
 
 from syncer.check import BaselineEntry, FileChange
-from syncer.config import Master, SyncRule, normalize_replica_path
+from syncer.config import Master, SyncRule, path_key
 from syncer.state import ReplicaState, State, load_state
 from syncer.sync import FileError, sync
 
@@ -33,7 +33,7 @@ def _change(rel_path, category, master_present=True, replica_present=True, basel
 
 
 def _applied(replica, changes):
-    return {normalize_replica_path(str(replica)): changes}
+    return {path_key(str(replica)): changes}
 
 
 def test_new_file_is_copied_to_replica(master_and_replica, layout):
@@ -218,7 +218,7 @@ def test_state_is_committed_per_replica_immediately_not_buffered_for_whole_run(
     sync(rule, applied, EMPTY_STATE, layout.state_path, layout.logs_dir)
 
     on_disk = load_state(layout.state_path).state
-    replica_a_key = normalize_replica_path(str(replica_a))
+    replica_a_key = path_key(str(replica_a))
     assert replica_a_key in on_disk.rules["r1"]
     assert "master/a.txt" in on_disk.rules["r1"][replica_a_key].files
 
@@ -227,7 +227,7 @@ def test_master_deleted_baseline_entry_is_dropped_from_state(master_and_replica,
     master, replica = master_and_replica
     (replica / "master" / "old.txt").write_text("gone")
     rule = _rule(master, [replica])
-    replica_key = normalize_replica_path(str(replica))
+    replica_key = path_key(str(replica))
     state = State(
         version=1,
         hash_algo="sha256",
@@ -415,6 +415,6 @@ def test_multi_master_rule_syncs_each_master_into_its_own_namespaced_subfolder(
     assert result.errors == []
 
     on_disk = load_state(layout.state_path).state
-    replica_key = normalize_replica_path(str(replica))
+    replica_key = path_key(str(replica))
     files = on_disk.rules["r1"][replica_key].files
     assert set(files) == {"master_a/x.txt", "master_b/y.txt"}

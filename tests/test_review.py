@@ -8,7 +8,7 @@ from syncer.check import (
     NamespaceCollision,
     ReplicaCheckResult,
 )
-from syncer.config import Master, SyncRule, normalize_replica_path
+from syncer.config import Master, SyncRule, path_key
 from syncer.review import (
     CATEGORY_BUCKET,
     CATEGORY_LABEL,
@@ -229,12 +229,12 @@ def test_a_preview_flags_a_cross_rule_collision_and_lists_no_files_under_it():
 def test_a_preview_matches_a_collision_on_a_replica_path_written_in_other_casing():
     written = "C:/Rep"
     collision = NamespaceCollision(
-        replica_path=normalize_replica_path(written), landing_path="skills", rule_ids=["r1", "r2"]
+        replica_path=path_key(written), landing_path="skills", rule_ids=["r1", "r2"]
     )
     rule = _preview([written], files=["skills/a.txt"], collisions=[collision])
 
     [replica] = rule.replicas
-    assert replica.replica_path == normalize_replica_path(written)
+    assert replica.replica_path == path_key(written)
     [master] = replica.children
     assert master.collision is collision
     assert master.children == []

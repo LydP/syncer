@@ -12,7 +12,7 @@ from syncer.check import (
     other_rule_names,
     scan_master_layout,
 )
-from syncer.config import Master, SyncRule, normalize_replica_path
+from syncer.config import Master, SyncRule, path_key
 
 # Any digest that can't match real content, for exercising a stale baseline.
 _STALE_HASH = "0" * 64
@@ -41,7 +41,7 @@ def _kept_entry_for(replica_path, master_path=None):
 
 def _baseline(replica, entries):
     """The `{normalized replica path: {rel_path: entry}}` shape state.json uses."""
-    return {normalize_replica_path(str(replica)): entries}
+    return {path_key(str(replica)): entries}
 
 
 def _rule(master, replicas, master_type="dir", rule_id="r1"):
@@ -789,7 +789,7 @@ def test_replica_path_is_reported_normalized(tmp_path):
     result = check(_rule(master, [replica]))
 
     [replica_result] = result.replicas
-    assert replica_result.replica_path == normalize_replica_path(str(replica))
+    assert replica_result.replica_path == path_key(str(replica))
     assert ".." not in replica_result.replica_path
 
 
@@ -917,7 +917,7 @@ def test_find_namespace_collisions_detects_two_rules_landing_at_the_same_spot(tm
     assert len(collisions) == 1
     [collision] = collisions
     assert collision.landing_path == "skills"
-    assert collision.replica_path == normalize_replica_path(str(replica))
+    assert collision.replica_path == path_key(str(replica))
     assert set(collision.rule_ids) == {"a", "b"}
 
 

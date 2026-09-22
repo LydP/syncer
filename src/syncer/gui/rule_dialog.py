@@ -52,7 +52,7 @@ from syncer.config import (
     find_replica_name_conflict,
     find_replica_sharers,
     native_path,
-    normalize_replica_path,
+    path_key,
     replica_label,
     replica_name,
     with_replica_name,
@@ -223,7 +223,7 @@ class RuleDialog(QDialog):
     ) -> str | None:
         basename_key = master_basename_key(master.path)
         for replica in self._replicas:
-            collision = per_master.get((normalize_replica_path(replica), basename_key))
+            collision = per_master.get((path_key(replica), basename_key))
             if collision is None:
                 continue
             other = ", ".join(other_rule_names(collision, self._rule_id, rules_by_id)) or (
@@ -298,8 +298,8 @@ class RuleDialog(QDialog):
     def _add_replica(self, path: str) -> None:
         # The one funnel for typed, dropped and Browse paths.
         path = native_path(path)
-        normalized = normalize_replica_path(path)
-        if any(normalize_replica_path(r) == normalized for r in self._replicas):
+        key = path_key(path)
+        if any(path_key(r) == key for r in self._replicas):
             return  # already in the list
         self._replicas.append(path)
         self._refresh_replica_list()

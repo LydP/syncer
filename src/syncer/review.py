@@ -26,7 +26,7 @@ from syncer.check import (
     ReplicaCheckResult,
     collisions_for_rule,
 )
-from syncer.config import Master, SyncRule, normalize_replica_path
+from syncer.config import Master, SyncRule, path_key
 from syncer.landing import LandingMap, master_basename, master_basename_key
 
 # category -> action bucket, spec.md §5's taxonomy table / §7's three
@@ -481,7 +481,7 @@ def build_preview_rule(
                 # Normalised like check()'s, so collisions (keyed the same
                 # way) match and the replica rows read the same.
                 ReplicaCheckResult(
-                    replica_path=normalize_replica_path(replica),
+                    replica_path=path_key(replica),
                     replica_exists=True,
                     has_baseline=False,
                     files=files,

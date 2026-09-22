@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from syncer.check import FileChange, baseline_from_disk, hash_file
-from syncer.config import SyncRule, normalize_replica_path
+from syncer.config import SyncRule, path_key
 from syncer.landing import LandingMap, replica_abs_path
 from syncer.review import (
     CONFLICT_CATEGORIES,
@@ -264,7 +264,7 @@ def apply_keep_replica(
     new_state = state
     for replica_root, updates in updates_by_replica.items():
         new_state = merge_replica_entries(
-            new_state, rule.id, normalize_replica_path(replica_root), updates, now=now
+            new_state, rule.id, path_key(replica_root), updates, now=now
         )
     save_state(state_path, new_state)
     return new_state

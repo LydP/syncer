@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from syncer.check import BaselineEntry, FileChange, baseline_from_disk
-from syncer.config import SyncRule, normalize_replica_path
+from syncer.config import SyncRule, path_key
 from syncer.landing import LandingMap, replica_abs_path
 from syncer.state import State, merge_replica_entries, save_state
 from syncer.storage import atomic_copy, make_writable, utc_file_stamp
@@ -41,7 +41,7 @@ def _copy_change(landing: LandingMap, replica_root: str, change: FileChange) -> 
 
 def _prune_empty_parents(replica_key: str, start_dir: str) -> None:
     current = os.path.normpath(start_dir)
-    while normalize_replica_path(current) != replica_key:
+    while path_key(current) != replica_key:
         parent = os.path.dirname(current)
         if parent == current:
             break  # hit the filesystem root without ever matching replica_root
@@ -81,7 +81,7 @@ def sync(
     ordered = [
         (replica, key, applied_changes[key])
         for replica in rule.replicas
-        if (key := normalize_replica_path(replica)) in applied_changes
+        if (key := path_key(replica)) in applied_changes
     ]
     total = sum(len(changes) for _, _, changes in ordered)
     done = 0

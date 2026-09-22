@@ -3,7 +3,7 @@ import time
 import pytest
 
 from syncer.check import BaselineEntry, FileChange, hash_file
-from syncer.config import Master, SyncRule, normalize_replica_path
+from syncer.config import Master, SyncRule, path_key
 from syncer.conflict import (
     MAX_DIFF_BYTES,
     apply_keep_replica,
@@ -327,12 +327,12 @@ def test_keep_replica_version_sets_kept_flag_and_baseline_to_replicas_content(
 
     new_state = apply_keep_replica(rule, {str(replica): [change]}, EMPTY_STATE, layout.state_path)
 
-    entry = new_state.rules["r1"][normalize_replica_path(str(replica))].files["master/a.txt"]
+    entry = new_state.rules["r1"][path_key(str(replica))].files["master/a.txt"]
     assert entry.kept is True
     assert entry.hash == hash_file(str(replica / "master" / "a.txt"))
 
     reloaded = load_state(layout.state_path).state
-    assert reloaded.rules["r1"][normalize_replica_path(str(replica))].files["master/a.txt"].kept is True
+    assert reloaded.rules["r1"][path_key(str(replica))].files["master/a.txt"].kept is True
 
 
 def test_keep_replica_version_works_for_a_file_with_no_sync_history(master_and_replica, layout):
@@ -344,7 +344,7 @@ def test_keep_replica_version_works_for_a_file_with_no_sync_history(master_and_r
 
     new_state = apply_keep_replica(rule, {str(replica): [change]}, EMPTY_STATE, layout.state_path)
 
-    entry = new_state.rules["r1"][normalize_replica_path(str(replica))].files["master/a.txt"]
+    entry = new_state.rules["r1"][path_key(str(replica))].files["master/a.txt"]
     assert entry.kept is True
     assert entry.hash == hash_file(str(replica / "master" / "a.txt"))
     assert entry.kept_master_hash == hash_file(str(master / "a.txt"))
@@ -354,8 +354,8 @@ def test_keep_replica_version_leaves_other_files_and_replicas_untouched(master_a
     master, replica = master_and_replica
     (replica / "master" / "a.txt").write_text("replica content")
     rule = _rule(master, [replica])
-    replica_key = normalize_replica_path(str(replica))
-    other_replica_key = normalize_replica_path(str(master.parent / "other"))
+    replica_key = path_key(str(replica))
+    other_replica_key = path_key(str(master.parent / "other"))
     untouched_entry = BaselineEntry(hash="deadbeef", size=1, mtime=1.0)
     starting_state = State(
         version=1,
@@ -395,7 +395,7 @@ def test_keep_replica_version_spans_every_replica_in_one_save(master_and_replica
 
     reloaded = load_state(layout.state_path).state
     for root in (replica, other):
-        entry = reloaded.rules["r1"][normalize_replica_path(str(root))].files["master/a.txt"]
+        entry = reloaded.rules["r1"][path_key(str(root))].files["master/a.txt"]
         assert entry.kept is True
         assert entry.hash == hash_file(str(root / "master" / "a.txt"))
     assert reloaded == new_state
@@ -429,7 +429,7 @@ def test_keep_replica_version_records_masters_hash_at_keep_time(master_and_repli
 
     new_state = apply_keep_replica(rule, {str(replica): [change]}, EMPTY_STATE, layout.state_path)
 
-    entry = new_state.rules["r1"][normalize_replica_path(str(replica))].files["master/a.txt"]
+    entry = new_state.rules["r1"][path_key(str(replica))].files["master/a.txt"]
     assert entry.kept_master_hash == hash_file(str(master / "a.txt"))
 
 
@@ -443,5 +443,5 @@ def test_keep_replica_version_with_master_absent_records_none_master_hash(
 
     new_state = apply_keep_replica(rule, {str(replica): [change]}, EMPTY_STATE, layout.state_path)
 
-    entry = new_state.rules["r1"][normalize_replica_path(str(replica))].files["master/a.txt"]
+    entry = new_state.rules["r1"][path_key(str(replica))].files["master/a.txt"]
     assert entry.kept_master_hash is None

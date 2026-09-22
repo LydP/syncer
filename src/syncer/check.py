@@ -5,7 +5,7 @@ import re
 import stat
 from dataclasses import dataclass, field, replace
 
-from syncer.config import Master, SyncRule, normalize_replica_path
+from syncer.config import Master, SyncRule, path_key
 from syncer.landing import LandingMap, master_basename, master_basename_key
 
 _IGNORED_DIR_NAMES = {".git", ".svn", ".hg", "__pycache__"}
@@ -559,7 +559,7 @@ def _check_replica(
             )
         )
     return ReplicaCheckResult(
-        replica_path=normalize_replica_path(plan.replica),
+        replica_path=path_key(plan.replica),
         replica_exists=plan.side.exists,
         has_baseline=bool(plan.baseline),
         files=files,
@@ -590,7 +590,7 @@ def check(
 
     plans = []
     for replica in rule.replicas:
-        replica_key = normalize_replica_path(replica)
+        replica_key = path_key(replica)
         replica_baseline = baseline.get(replica_key, {})
         baseline_by_key = {os.path.normcase(p): p for p in replica_baseline}
         side = _scan_side(replica, "dir")
@@ -661,7 +661,7 @@ def find_namespace_collisions(rules: list[SyncRule]) -> list[NamespaceCollision]
         # (CONTEXT.md's Avoid line for this term).
         basenames = [master_basename(master.path) for master in rule.masters]
         for replica in rule.replicas:
-            replica_key = normalize_replica_path(replica)
+            replica_key = path_key(replica)
             for basename in basenames:
                 slot = slots.setdefault(
                     (replica_key, master_basename_key(basename)),

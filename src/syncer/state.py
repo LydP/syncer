@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from syncer.check import HASH_ALGO, BaselineEntry
-from syncer.config import Config, normalize_replica_path
+from syncer.config import Config, path_key
 from syncer.landing import LandingMap
 from syncer.storage import atomic_write_bytes, utc_file_stamp
 
@@ -180,7 +180,7 @@ def reconcile_with_config(state: State, config: Config) -> State:
     """
     configured = {
         rule.id: (
-            {normalize_replica_path(replica) for replica in rule.replicas},
+            {path_key(replica) for replica in rule.replicas},
             LandingMap(rule.masters),
         )
         for rule in config.rules

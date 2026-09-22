@@ -12,7 +12,7 @@ from syncer.config import (
     ReplicaName,
     SyncRule,
     load_config,
-    normalize_replica_path,
+    path_key,
     save_config,
 )
 from syncer.review import changes_by_replica, iter_leaves, tally
@@ -364,7 +364,7 @@ def test_pending_deletions_reports_only_the_deletions_in_a_mixed_selection(
     deletions = session.pending_deletions("r1")
 
     assert {key: [c.rel_path for c in changes] for key, changes in deletions.items()} == {
-        normalize_replica_path(str(replica)): ["master/gone.txt"]
+        path_key(str(replica)): ["master/gone.txt"]
     }
 
 
@@ -490,7 +490,7 @@ def test_conflict_queue_and_bulk_candidates_can_be_narrowed_to_one_replica(
     rule = replace(_rule(master, replica), replicas=[str(replica), str(other)])
     session = _session(layout, rule)
     _checked(session)
-    replica_key = normalize_replica_path(str(replica))
+    replica_key = path_key(str(replica))
 
     assert len(session.conflict_queue("r1")) == 2
     assert [leaf.replica_path for leaf in session.conflict_queue("r1", replica_key)] == [

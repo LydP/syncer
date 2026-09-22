@@ -24,7 +24,7 @@ from syncer.config import (
     find_replica_sharers,
     load_config,
     native_path,
-    normalize_replica_path,
+    path_key,
     replica_label,
     save_config,
     with_replica_name,
@@ -180,8 +180,8 @@ def test_find_replica_sharers_excludes_the_given_rule_id():
     assert find_replica_sharers(config, r"C:\ProjectA\skills\a", exclude_rule_id="r1") == []
 
 
-def test_normalize_replica_path_resolves_relative_segments_and_case():
-    normalized = normalize_replica_path(r"C:\MyStuff\ProjectA\..\ProjectA\.claude\SKILLS")
+def test_path_key_resolves_relative_segments_and_case():
+    normalized = path_key(r"C:\MyStuff\ProjectA\..\ProjectA\.claude\SKILLS")
 
     assert normalized == r"c:\mystuff\projecta\.claude\skills"
 
