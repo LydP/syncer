@@ -9,6 +9,9 @@ from syncer.config import (
     ConfigClobberError,
     ConfigError,
     ConfigStore,
+    Dependency,
+    DependencyCycleError,
+    DuplicateDependencyError,
     DuplicateMasterError,
     DuplicateMasterPathError,
     DuplicateReplicaNameError,
@@ -49,8 +52,20 @@ def _rule_toml(rule_id, masters, replicas=(), name=None):
     )
 
 
+def _dependency_toml(master_path, depends_on_path, master_type="dir"):
+    return (
+        "[[dependency]]\n"
+        f"master = {{ path = '{master_path}', type = '{master_type}' }}\n"
+        f"depends_on = {{ path = '{depends_on_path}', type = 'dir' }}\n"
+    )
+
+
 def _write_config(config_path, *rule_tomls):
     config_path.write_text(CONFIG_HEADER + "\n".join(rule_tomls))
+
+
+def _dependency(master_path, depends_on_path):
+    return Dependency(Master(master_path, "dir"), Master(depends_on_path, "dir"))
 
 
 def test_default_rule_name_strips_extension_for_a_file_master():
@@ -444,6 +459,121 @@ def test_save_config_round_trips_a_replica_name(layout):
     assert load_config(layout.config_path) == config
 
 
+@pytest.mark.parametrize(
+    "edges",
+    [
+        [(r"C:\skills\uses-python", r"C:\skills\python-extras")],
+        [(r"C:\a", r"C:\b"), (r"C:\a", r"C:\c")],
+        [(r"C:\a", r"C:\b"), (r"C:\a", r"C:\c"), (r"C:\b", r"C:\d"), (r"C:\c", r"C:\d")],
+    ],
+    ids=["one-edge", "two-from-one-master", "diamond"],
+)
+def test_save_config_round_trips_dependencies(layout, edges):
+    config = Config(
+        version=1,
+        rules=[_rule("r1", Master(r"C:\skills\uses-python", "dir"))],
+        dependencies=[_dependency(master, depends_on) for master, depends_on in edges],
+    )
+
+    save_config(layout.config_path, config, layout.backups_dir)
+
+    assert load_config(layout.config_path) == config
+
+
+def test_save_config_round_trips_ignore_dependencies(layout):
+    rule = replace(
+        _rule("11111111-1111-4111-8111-111111111111", Master(r"C:\skills\uses-python", "dir")),
+        ignore_dependencies=True,
+    )
+    config = Config(version=1, rules=[rule])
+
+    save_config(layout.config_path, config, layout.backups_dir)
+
+    assert load_config(layout.config_path).rules[0].ignore_dependencies is True
+
+
+def test_load_config_defaults_ignore_dependencies_to_false(layout):
+    _write_config(
+        layout.config_path,
+        _rule_toml("11111111-1111-4111-8111-111111111111", [(r"C:\a", "dir")]),
+    )
+
+    assert load_config(layout.config_path).rules[0].ignore_dependencies is False
+
+
+def test_save_config_omits_the_dependency_array_when_there_are_none(layout):
+    save_config(layout.config_path, Config(version=1), layout.backups_dir)
+
+    assert "dependency" not in layout.config_path.read_text()
+
+
+@pytest.mark.parametrize(
+    "dependency_toml",
+    [
+        "master = { path = 'C:\\a', type = 'dir' }\n",
+        "depends_on = { path = 'C:\\b', type = 'dir' }\n",
+        "master = { path = 'C:\\a', type = 'folder' }\n"
+        "depends_on = { path = 'C:\\b', type = 'dir' }\n",
+        "master = 'C:\\a'\ndepends_on = { path = 'C:\\b', type = 'dir' }\n",
+    ],
+    ids=["no-depends-on", "no-master", "bad-type", "master-not-a-table"],
+)
+def test_load_config_rejects_a_malformed_dependency(layout, dependency_toml):
+    _write_config(layout.config_path, "[[dependency]]\n" + dependency_toml)
+
+    with pytest.raises(ConfigError):
+        load_config(layout.config_path)
+
+
+def test_save_config_rejects_a_duplicate_dependency_ignoring_case_and_slash_form(layout):
+    config = Config(
+        version=1,
+        dependencies=[_dependency(r"C:\a", r"C:\b"), _dependency("c:/A", "C:/B")],
+    )
+
+    with pytest.raises(DuplicateDependencyError):
+        save_config(layout.config_path, config, layout.backups_dir)
+
+    assert not layout.config_path.exists()
+
+
+def test_load_config_rejects_a_duplicate_dependency(layout):
+    edge = _dependency_toml(r"C:\a", r"C:\b")
+    _write_config(layout.config_path, edge, edge)
+
+    with pytest.raises(DuplicateDependencyError):
+        load_config(layout.config_path)
+
+
+@pytest.mark.parametrize(
+    "edges",
+    [
+        [(r"C:\a", r"C:\a")],
+        [(r"C:\a", r"C:\b"), (r"C:\b", r"C:\a")],
+        [(r"C:\a", r"C:\b"), (r"C:\b", r"C:\c"), ("c:/A", r"C:\c"), (r"C:\c", "C:/a")],
+    ],
+    ids=["self-edge", "two-cycle", "longer-cycle-via-other-spelling"],
+)
+def test_save_config_rejects_a_dependency_cycle_without_writing(layout, edges):
+    config = Config(version=1, dependencies=[_dependency(a, b) for a, b in edges])
+
+    with pytest.raises(DependencyCycleError):
+        save_config(layout.config_path, config, layout.backups_dir)
+
+    assert not layout.config_path.exists()
+
+
+def test_load_config_rejects_a_dependency_cycle(layout):
+    _write_config(
+        layout.config_path,
+        _dependency_toml(r"C:\a", r"C:\b"),
+        _dependency_toml(r"C:\b", r"C:\a"),
+    )
+
+    with pytest.raises(DependencyCycleError):
+        load_config(layout.config_path)
+
+
 def _config_with_named_replicas(*named):
     """A config whose one rule lists every replica in `named`, a list of (path, name)."""
     return Config(
@@ -683,6 +813,17 @@ def test_config_store_save_then_load_round_trips(layout):
     store.save(config)
 
     assert store.load() == config
+
+
+def test_config_store_save_then_load_round_trips_dependencies(layout):
+    store = ConfigStore(layout.config_path, layout.backups_dir)
+    rule = replace(_rule("r1", Master(r"C:\a", "dir")), ignore_dependencies=True)
+    config = Config(version=1, rules=[rule], dependencies=[_dependency(r"C:\a", r"C:\b")])
+
+    store.save(config)
+
+    assert store.load() == config
+    assert len(list(layout.backups_dir.glob("config-*.toml"))) == 1
 
 
 def test_config_store_load_returns_an_empty_config_when_no_file_exists(layout):

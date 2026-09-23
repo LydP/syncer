@@ -181,14 +181,21 @@ class RuleDialog(QDialog):
 
     # -- draft rule, for live cross-rule collision preview ------------------
 
+    def _rule_named(self, name: str) -> SyncRule:
+        """The rule this dialog would save under `name`. The one place a rule
+        is built, so the live preview and the accepted rule can never differ
+        by a field one of them forgot. For an edit it's replace(), not a
+        field-by-field rebuild, so fields the dialog doesn't touch (`ignore`,
+        `ignore_dependencies`) carry over untouched.
+        """
+        masters = list(self._masters)
+        replicas = list(self._replicas)
+        if self._existing_rule is not None:
+            return replace(self._existing_rule, name=name, masters=masters, replicas=replicas)
+        return SyncRule(id=self._rule_id, name=name, masters=masters, replicas=replicas)
+
     def _draft_rule(self) -> SyncRule:
-        return SyncRule(
-            id=self._rule_id,
-            name=self.name_edit.text().strip() or self._rule_id,
-            masters=list(self._masters),
-            replicas=list(self._replicas),
-            ignore=self._existing_rule.ignore if self._existing_rule else [],
-        )
+        return self._rule_named(self.name_edit.text().strip() or self._rule_id)
 
     def _draft_rules(self) -> list[SyncRule]:
         # with_rule(), not a hand-rolled add-or-replace, so the preview is
@@ -377,19 +384,11 @@ class RuleDialog(QDialog):
             return
         self.name_error.hide()
 
-        masters = list(self._masters)
-        replicas = list(self._replicas)
-        if self._existing_rule is not None:
-            # replace(), not a field-by-field rebuild, so fields the dialog
-            # doesn't edit (e.g. `ignore`) carry over untouched.
-            rule = replace(self._existing_rule, name=name, masters=masters, replicas=replicas)
-        else:
-            rule = SyncRule(id=self._rule_id, name=name, masters=masters, replicas=replicas)
-        result_config = with_rule(self._config, rule)
+        result_config = with_rule(self._config, self._rule_named(name))
         # Naming only checks the draft at that moment: a replica removed and
         # re-added afterwards brings its old name back, which may since have
         # been given to another replica — and save_config would reject that.
-        for replica in replicas:
+        for replica in self._replicas:
             taken = replica_name(result_config, replica)
             conflict = taken and find_replica_name_conflict(result_config, replica, taken)
             if conflict:

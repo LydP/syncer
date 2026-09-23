@@ -2,9 +2,11 @@ import filecmp
 import os
 import shutil
 import tomllib
-from collections.abc import Callable
+from collections.abc import Callable, Hashable
 from dataclasses import asdict, dataclass, field, replace
+from graphlib import CycleError, TopologicalSorter
 from pathlib import Path
+from typing import TypeVar
 
 import tomli_w
 
@@ -13,6 +15,10 @@ from syncer.storage import SyncerError, atomic_write_bytes, utc_file_stamp
 
 MAX_CONFIG_BACKUPS = 10
 MASTER_TYPES = ("dir", "file")
+
+# `_reject_duplicates` reports the offending item itself, so its items are
+# whatever spelling the user typed, keyed on a separate identity function.
+_Item = TypeVar("_Item")
 
 
 class ConfigError(SyncerError):
@@ -33,6 +39,14 @@ class DuplicateRuleNameError(SyncerError):
 
 class DuplicateReplicaNameError(SyncerError):
     """Two replicas share a name (case-insensitively)."""
+
+
+class DuplicateDependencyError(SyncerError):
+    """The same dependency (master and what it depends on) is declared twice."""
+
+
+class DependencyCycleError(SyncerError):
+    """Dependencies form a cycle, including a master depending on itself."""
 
 
 class ConfigClobberError(SyncerError):
@@ -68,12 +82,25 @@ class Master:
 
 
 @dataclass(frozen=True)
+class Dependency:
+    """`master` depends on `depends_on` (ADR 0006). Identity is the pair of
+    `path_key`s (`dependency_key`), so there is no id."""
+
+    master: Master
+    depends_on: Master
+
+    def __str__(self) -> str:
+        return f"{self.master.path} -> {self.depends_on.path}"
+
+
+@dataclass(frozen=True)
 class SyncRule:
     id: str
     name: str
     masters: list[Master]
     replicas: list[str] = field(default_factory=list)
     ignore: list[str] = field(default_factory=list)
+    ignore_dependencies: bool = False
 
 
 @dataclass(frozen=True)
@@ -87,6 +114,7 @@ class Config:
     version: int
     rules: list[SyncRule] = field(default_factory=list)
     replica_names: list[ReplicaName] = field(default_factory=list)
+    dependencies: list[Dependency] = field(default_factory=list)
 
 
 def _rule_name_key(name: str) -> str:
@@ -95,6 +123,12 @@ def _rule_name_key(name: str) -> str:
 
 def _replica_name_key(name: str) -> str:
     return name.strip().casefold()
+
+
+def _dependency_key(dependency: Dependency) -> tuple[str, str]:
+    """A dependency's identity: both ends' `path_key`s, so casing and `/` vs
+    `\\` spelling differences still name the one edge."""
+    return (path_key(dependency.master.path), path_key(dependency.depends_on.path))
 
 
 def find_name_conflict(
@@ -229,10 +263,10 @@ def replica_label(config: Config, path: str) -> str:
     return replica_name(config, path) or path
 
 
-def _require_str(table: dict, key: str) -> str:
+def _require_str(table: dict, key: str, context: str = "key") -> str:
     value = table.get(key)
     if not isinstance(value, str):
-        raise ConfigError(f"key {key!r} must be a string, got {value!r}")
+        raise ConfigError(f"{context} {key!r} must be a string, got {value!r}")
     return value
 
 
@@ -243,6 +277,13 @@ def _require_str_list(table: dict, key: str) -> list[str]:
     return value
 
 
+def _require_bool(table: dict, key: str) -> bool:
+    value = table.get(key, False)
+    if not isinstance(value, bool):
+        raise ConfigError(f"key {key!r} must be true or false, got {value!r}")
+    return value
+
+
 def _require_table_array(raw: dict, key: str, config_path: Path) -> list:
     value = raw.get(key, [])
     if not isinstance(value, list):
@@ -250,15 +291,30 @@ def _require_table_array(raw: dict, key: str, config_path: Path) -> list:
     return value
 
 
-def _parse_master(raw_master: object) -> Master:
+def _parse_master(raw_master: object, context: str = "each rule's 'masters' entry") -> Master:
+    """`context` names which master is being parsed, and rides along into every
+    error below — a hand-edited `config.toml` holds many masters, and "key 'type'
+    must be a string" alone doesn't say which one to go and fix."""
     if not isinstance(raw_master, dict):
-        raise ConfigError(f"each rule's 'masters' entry must be a table, got {raw_master!r}")
-    master_type = _require_str(raw_master, "type")
+        raise ConfigError(f"{context} must be a table, got {raw_master!r}")
+    master_type = _require_str(raw_master, "type", f"{context}: key")
     if master_type not in MASTER_TYPES:
         raise ConfigError(
-            f"master key 'type' must be one of {MASTER_TYPES}, got {master_type!r}"
+            f"{context}: key 'type' must be one of {MASTER_TYPES}, got {master_type!r}"
         )
-    return Master(path=native_path(_require_str(raw_master, "path")), type=master_type)
+    path = _require_str(raw_master, "path", f"{context}: key")
+    return Master(path=native_path(path), type=master_type)
+
+
+def _parse_dependency(raw_dependency: object) -> Dependency:
+    if not isinstance(raw_dependency, dict):
+        raise ConfigError(f"each [[dependency]] must be a table, got {raw_dependency!r}")
+    return Dependency(
+        master=_parse_master(raw_dependency.get("master"), "a [[dependency]]'s 'master'"),
+        depends_on=_parse_master(
+            raw_dependency.get("depends_on"), "a [[dependency]]'s 'depends_on'"
+        ),
+    )
 
 
 def _parse_replica_name(raw_replica: object) -> ReplicaName:
@@ -282,14 +338,15 @@ def _parse_rule(raw_rule: object) -> SyncRule:
         masters=[_parse_master(raw_master) for raw_master in raw_masters],
         replicas=[native_path(r) for r in _require_str_list(raw_rule, "replicas")],
         ignore=_require_str_list(raw_rule, "ignore"),
+        ignore_dependencies=_require_bool(raw_rule, "ignore_dependencies"),
     )
 
 
 def _reject_duplicates(
-    items: list[str],
+    items: list[_Item],
     error_cls: type[SyncerError],
     message: str,
-    key: Callable[[str], str],
+    key: Callable[[_Item], Hashable],
 ) -> None:
     seen = set()
     for item in items:
@@ -353,6 +410,27 @@ def _validate_replica_names(replica_names: list[ReplicaName]) -> None:
     )
 
 
+def _validate_dependencies(dependencies: list[Dependency]) -> None:
+    _reject_duplicates(
+        dependencies,
+        DuplicateDependencyError,
+        "dependency declared more than once",
+        key=_dependency_key,
+    )
+    # prepare() is the cycle check: a topological order exists iff there is
+    # none, and a self-edge is just the shortest cycle.
+    sorter: TopologicalSorter[str] = TopologicalSorter()
+    for dependency in dependencies:
+        master, depends_on = _dependency_key(dependency)
+        sorter.add(master, depends_on)
+    try:
+        sorter.prepare()
+    except CycleError as exc:
+        raise DependencyCycleError(
+            "dependencies form a cycle: " + " -> ".join(exc.args[1])
+        ) from exc
+
+
 def load_config(config_path: Path) -> Config:
     with open(config_path, "rb") as fh:
         try:
@@ -368,10 +446,22 @@ def load_config(config_path: Path) -> Config:
         _parse_replica_name(raw_replica)
         for raw_replica in _require_table_array(raw, "replica", config_path)
     ]
+    dependencies = [
+        _parse_dependency(raw_dependency)
+        for raw_dependency in _require_table_array(raw, "dependency", config_path)
+    ]
     # Tidied as a save would be, so a hand-edit's blank or orphaned names mean
     # "no name" here too rather than tripping the duplicate check.
-    config = _tidy_replica_names(Config(version=version, rules=rules, replica_names=replica_names))
+    config = _tidy_replica_names(
+        Config(
+            version=version,
+            rules=rules,
+            replica_names=replica_names,
+            dependencies=dependencies,
+        )
+    )
     _validate_replica_names(config.replica_names)
+    _validate_dependencies(config.dependencies)
     return config
 
 
@@ -383,6 +473,8 @@ def _config_to_dict(config: Config) -> dict:
     }
     if config.replica_names:
         raw["replica"] = [asdict(replica) for replica in config.replica_names]
+    if config.dependencies:
+        raw["dependency"] = [asdict(dependency) for dependency in config.dependencies]
     return raw
 
 
@@ -404,6 +496,7 @@ def save_config(config_path: Path, config: Config, backups_dir: Path) -> None:
     config = _tidy_replica_names(config)
     _validate_rules(config.rules)
     _validate_replica_names(config.replica_names)
+    _validate_dependencies(config.dependencies)
     # Back up whatever save is about to destroy, not what it just wrote — the
     # latter is already sitting live in config_path with nothing at risk.
     # Otherwise a hand-edit made between loads is overwritten with no backup
