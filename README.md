@@ -91,7 +91,8 @@ venv\Scripts\python -m pytest
 
 1. Bump `version` in `pyproject.toml`.
 2. Write the notes in `docs/releases/vX.Y.Z.md`, covering only changes a user would notice.
-   The in-app update dialog shows them.
+   The in-app update dialog shows them. Put each paragraph and bullet on one line: GitHub
+   turns every line break in release notes into a visible break.
 3. Commit, then tag `vX.Y.Z` and push the tag. The release workflow checks that the tag matches
    `pyproject.toml`, builds and zips the app, and publishes the GitHub Release with those notes.
 
