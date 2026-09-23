@@ -8,11 +8,12 @@ from syncer.check import (
     baseline_from_disk,
     check,
     find_namespace_collisions,
+    find_unmet_dependencies,
     hash_file,
     other_rule_names,
     scan_master_layout,
 )
-from syncer.config import Master, SyncRule, path_key
+from syncer.config import Dependency, Master, SyncRule, path_key
 
 # Any digest that can't match real content, for exercising a stale baseline.
 _STALE_HASH = "0" * 64
@@ -1009,3 +1010,73 @@ def test_check_suppression_is_scoped_to_the_colliding_replica_only(tmp_path):
 
     assert shared_result.files == []
     assert solo_result.files != []
+
+
+# -- unmet dependencies (issue #58) ------------------------------------------
+
+
+def test_find_unmet_dependencies_flags_a_dependency_whose_target_the_rule_lacks(tmp_path):
+    master_a = Master(path=str(tmp_path / "uses-python"), type="dir")
+    master_b = Master(path=str(tmp_path / "python-extras"), type="dir")
+    rule = _multi_rule([master_a], [tmp_path / "replica"])
+    dependency = Dependency(master=master_a, depends_on=master_b)
+
+    unmet = find_unmet_dependencies(rule, [dependency])
+
+    assert len(unmet) == 1
+    assert unmet[0].master == master_a
+    assert unmet[0].depends_on == master_b
+
+
+def test_find_unmet_dependencies_is_empty_when_the_rule_already_contains_both_ends(tmp_path):
+    master_a = Master(path=str(tmp_path / "uses-python"), type="dir")
+    master_b = Master(path=str(tmp_path / "python-extras"), type="dir")
+    rule = _multi_rule([master_a, master_b], [tmp_path / "replica"])
+    dependency = Dependency(master=master_a, depends_on=master_b)
+
+    assert find_unmet_dependencies(rule, [dependency]) == []
+
+
+def test_find_unmet_dependencies_ignores_edges_whose_master_the_rule_lacks(tmp_path):
+    rule_master = Master(path=str(tmp_path / "notes"), type="dir")
+    other_master = Master(path=str(tmp_path / "uses-python"), type="dir")
+    depends_on = Master(path=str(tmp_path / "python-extras"), type="dir")
+    rule = _multi_rule([rule_master], [tmp_path / "replica"])
+    dependency = Dependency(master=other_master, depends_on=depends_on)
+
+    assert find_unmet_dependencies(rule, [dependency]) == []
+
+
+def test_find_unmet_dependencies_matches_by_path_key_across_casing_and_separators(tmp_path):
+    rule_master = Master(path=str(tmp_path / "Uses-Python").upper(), type="dir")
+    depends_on = Master(path=str(tmp_path / "python-extras"), type="dir")
+    rule = _multi_rule([rule_master, depends_on], [tmp_path / "replica"])
+    # The dependency edge names the same master path in different casing.
+    edge_master = Master(path=str(tmp_path / "uses-python").lower(), type="dir")
+    dependency = Dependency(master=edge_master, depends_on=depends_on)
+
+    assert find_unmet_dependencies(rule, [dependency]) == []
+
+
+def test_find_unmet_dependencies_orders_by_rule_master_order_then_edge_order(tmp_path):
+    master_1 = Master(path=str(tmp_path / "one"), type="dir")
+    master_2 = Master(path=str(tmp_path / "two"), type="dir")
+    target_a = Master(path=str(tmp_path / "target-a"), type="dir")
+    target_b = Master(path=str(tmp_path / "target-b"), type="dir")
+    # masters listed 2 then 1, so rule order (not declaration order) should win.
+    rule = _multi_rule([master_2, master_1], [tmp_path / "replica"])
+    # edges for master_1 declared before master_2's, and two edges for
+    # master_2 in a specific order, to prove both tiers of ordering.
+    dependencies = [
+        Dependency(master=master_1, depends_on=target_a),
+        Dependency(master=master_2, depends_on=target_a),
+        Dependency(master=master_2, depends_on=target_b),
+    ]
+
+    unmet = find_unmet_dependencies(rule, dependencies)
+
+    assert [(u.master, u.depends_on) for u in unmet] == [
+        (master_2, target_a),
+        (master_2, target_b),
+        (master_1, target_a),
+    ]

@@ -24,6 +24,7 @@ from syncer.check import (
     MasterStatus,
     NamespaceCollision,
     ReplicaCheckResult,
+    UnmetDependency,
     collisions_for_rule,
 )
 from syncer.config import Master, SyncRule, path_key
@@ -239,6 +240,10 @@ class ReviewRule:
     rule_id: str
     rule_name: str
     replicas: list[ReviewReplica] = field(default_factory=list)
+    # CONTEXT.md's Unmet dependency: purely informational (no bucket, no
+    # effect on blocked/tickable/tally), computed by the caller.
+    unmet_dependencies: list[UnmetDependency] = field(default_factory=list)
+    dependencies_ignored: bool = False
 
     def unlock(self, landing_path: str) -> ReviewRule:
         """A new `ReviewRule` with the master landing at `landing_path`
@@ -449,7 +454,10 @@ def blocked_master_count(rule: ReviewRule) -> int:
 
 
 def build_preview_rule(
-    rule: SyncRule, layout: MasterLayout, collisions: list[NamespaceCollision] | None = None
+    rule: SyncRule,
+    layout: MasterLayout,
+    collisions: list[NamespaceCollision] | None = None,
+    unmet_dependencies: list[UnmetDependency] | None = None,
 ) -> ReviewRule:
     """What each replica should contain per the masters, before any check has
     run (`scan_master_layout`'s names, nothing read from the replicas) — built
@@ -490,16 +498,25 @@ def build_preview_rule(
             ],
         ),
         collisions=collisions,
+        unmet_dependencies=unmet_dependencies,
+        dependencies_ignored=rule.ignore_dependencies,
     )
 
 
 def build_review_rule(
-    check_result: CheckResult, collisions: list[NamespaceCollision] | None = None
+    check_result: CheckResult,
+    collisions: list[NamespaceCollision] | None = None,
+    unmet_dependencies: list[UnmetDependency] | None = None,
+    dependencies_ignored: bool = False,
 ) -> ReviewRule:
     """`collisions` should be `find_namespace_collisions()`'s full result (or
     any subset) — narrowed here to the ones naming this rule and matched to
     each replica by path, so a caller can just pass the whole-config list
     through for every rule it builds.
+
+    `unmet_dependencies` and `dependencies_ignored` are carried through as
+    given — pass the same values as to `build_preview_rule` so the badge
+    matches before and after a check.
     """
     collided = collisions_for_rule(check_result.rule_id, collisions)
     landing = LandingMap([status.master for status in check_result.masters])
@@ -510,4 +527,6 @@ def build_review_rule(
             _build_replica(r, check_result.masters, landing, collided)
             for r in check_result.replicas
         ],
+        unmet_dependencies=list(unmet_dependencies or []),
+        dependencies_ignored=dependencies_ignored,
     )

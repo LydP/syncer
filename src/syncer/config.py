@@ -125,7 +125,7 @@ def _replica_name_key(name: str) -> str:
     return name.strip().casefold()
 
 
-def _dependency_key(dependency: Dependency) -> tuple[str, str]:
+def dependency_key(dependency: Dependency) -> tuple[str, str]:
     """A dependency's identity: both ends' `path_key`s, so casing and `/` vs
     `\\` spelling differences still name the one edge."""
     return (path_key(dependency.master.path), path_key(dependency.depends_on.path))
@@ -415,13 +415,13 @@ def _validate_dependencies(dependencies: list[Dependency]) -> None:
         dependencies,
         DuplicateDependencyError,
         "dependency declared more than once",
-        key=_dependency_key,
+        key=dependency_key,
     )
     # prepare() is the cycle check: a topological order exists iff there is
     # none, and a self-edge is just the shortest cycle.
     sorter: TopologicalSorter[str] = TopologicalSorter()
     for dependency in dependencies:
-        master, depends_on = _dependency_key(dependency)
+        master, depends_on = dependency_key(dependency)
         sorter.add(master, depends_on)
     try:
         sorter.prepare()

@@ -7,6 +7,7 @@ from syncer.check import (
     MasterStatus,
     NamespaceCollision,
     ReplicaCheckResult,
+    UnmetDependency,
 )
 from syncer.config import Master, SyncRule, path_key
 from syncer.review import (
@@ -50,7 +51,9 @@ def _replica_result(replica_path, files):
     )
 
 
-def _rule_for(replicas, masters=(MasterStatus(master=DIR_MASTER, missing=False),), collisions=()):
+def _rule_for(
+    replicas, masters=(MasterStatus(master=DIR_MASTER, missing=False),), collisions=(), **kwargs
+):
     return build_review_rule(
         CheckResult(
             rule_id="r1",
@@ -59,6 +62,7 @@ def _rule_for(replicas, masters=(MasterStatus(master=DIR_MASTER, missing=False),
             replicas=replicas,
         ),
         collisions=collisions,
+        **kwargs,
     )
 
 
@@ -166,13 +170,27 @@ def test_a_blocked_file_type_master_has_no_leaf_to_show_but_is_still_a_file_mast
         assert blocked.blocked
 
 
-def _preview(replicas, masters=(DIR_MASTER,), files=(), missing=(), collisions=()):
-    rule = SyncRule(id="r1", name="Rule 1", masters=list(masters), replicas=list(replicas))
+def _preview(
+    replicas,
+    masters=(DIR_MASTER,),
+    files=(),
+    missing=(),
+    collisions=(),
+    ignore_dependencies=False,
+    **kwargs,
+):
+    rule = SyncRule(
+        id="r1",
+        name="Rule 1",
+        masters=list(masters),
+        replicas=list(replicas),
+        ignore_dependencies=ignore_dependencies,
+    )
     layout = MasterLayout(
         files=list(files),
         statuses=[MasterStatus(master=m, missing=m in missing) for m in masters],
     )
-    return build_preview_rule(rule, layout, collisions=collisions)
+    return build_preview_rule(rule, layout, collisions=collisions, **kwargs)
 
 
 def test_preview_shows_every_replica_with_the_masters_real_layout():
@@ -594,3 +612,35 @@ def test_a_collision_in_a_different_replica_does_not_apply_here():
 
     master = _master_node(rule)
     assert master.collision is None
+
+
+# -- unmet dependencies (issue #58) ------------------------------------------
+
+
+def test_build_review_rule_defaults_to_no_unmet_dependencies_and_not_ignored():
+    rule = _rule_for([_replica_result(REP, [])])
+
+    assert rule.unmet_dependencies == []
+    assert rule.dependencies_ignored is False
+
+
+_UNMET = UnmetDependency(
+    master=Master(path="c:\\skills\\uses-python", type="dir"),
+    depends_on=Master(path="c:\\skills\\python-extras", type="dir"),
+)
+
+
+def test_build_review_rule_carries_unmet_dependencies_and_dependencies_ignored():
+    rule = _rule_for(
+        [_replica_result(REP, [])], unmet_dependencies=[_UNMET], dependencies_ignored=True
+    )
+
+    assert rule.unmet_dependencies == [_UNMET]
+    assert rule.dependencies_ignored is True
+
+
+def test_build_preview_rule_derives_dependencies_ignored_and_forwards_unmet_dependencies():
+    preview = _preview([REP], ignore_dependencies=True, unmet_dependencies=[_UNMET])
+
+    assert preview.unmet_dependencies == [_UNMET]
+    assert preview.dependencies_ignored is True

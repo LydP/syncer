@@ -5,7 +5,7 @@ import re
 import stat
 from dataclasses import dataclass, field, replace
 
-from syncer.config import Master, SyncRule, path_key
+from syncer.config import Dependency, Master, SyncRule, dependency_key, path_key
 from syncer.landing import LandingMap, master_basename, master_basename_key
 
 _IGNORED_DIR_NAMES = {".git", ".svn", ".hg", "__pycache__"}
@@ -647,6 +647,37 @@ def check(
         masters=master_statuses,
         replicas=replicas,
     )
+
+
+@dataclass(frozen=True)
+class UnmetDependency:
+    """`master` depends on `depends_on` (CONTEXT.md's **Dependency**), and
+    `depends_on` is missing from the rule `find_unmet_dependencies` was asked
+    about — CONTEXT.md's **Unmet dependency**, a config-shape fact like
+    `NamespaceCollision`."""
+
+    master: Master
+    depends_on: Master
+
+
+def find_unmet_dependencies(
+    rule: SyncRule, dependencies: list[Dependency]
+) -> list[UnmetDependency]:
+    """Every `dependencies` edge whose `master` the rule contains but whose
+    `depends_on` it doesn't (CONTEXT.md's **Unmet dependency**) — matched by
+    `path_key` alone, no `type` comparison, and no filesystem read. Ordered by
+    `rule.masters`' own order, then by `dependencies`' own order, so the badge
+    a rule shows is stable regardless of how the global dependency list is
+    ordered.
+    """
+    rule_keys = [path_key(master.path) for master in rule.masters]
+    edges = [(dependency_key(d), d) for d in dependencies]
+    return [
+        UnmetDependency(master=d.master, depends_on=d.depends_on)
+        for master_key in rule_keys
+        for (edge_master, edge_depends_on), d in edges
+        if edge_master == master_key and edge_depends_on not in rule_keys
+    ]
 
 
 def find_namespace_collisions(rules: list[SyncRule]) -> list[NamespaceCollision]:
