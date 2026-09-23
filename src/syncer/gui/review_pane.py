@@ -23,6 +23,7 @@ from collections.abc import Iterator
 from PySide6.QtCore import QCoreApplication, QSignalBlocker, QThread, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFont
 from PySide6.QtWidgets import (
+    QCheckBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -42,11 +43,18 @@ from syncer.check import (
     CheckResult,
     MasterLayout,
     NamespaceCollision,
+    UnmetDependency,
     check,
     other_rule_names,
     scan_master_layout,
 )
-from syncer.config import SyncRule, replica_label
+from syncer.config import (
+    ConfigClobberError,
+    DuplicateMasterError,
+    SyncRule,
+    path_key,
+    replica_label,
+)
 from syncer.gui.conflict_dialog import ConflictDialog, bulk_overwrite, error_detail
 from syncer.landing import master_basename
 from syncer.review import (
@@ -69,6 +77,7 @@ _CHECK_STATE = {
 _TALLY_WORDING = (("safe", "to sync"), ("delete", "to delete"), ("conflict", "conflict"))
 
 _GREY = QColor("#9a9a9a")
+_VIOLET = QColor("#6a3fa0")  # an unmet dependency that is still actionable
 
 # The ReviewReplica/ReviewMaster/ReviewFolder/ReviewLeaf a tree item mirrors.
 #
@@ -77,6 +86,8 @@ _GREY = QColor("#9a9a9a")
 # tree building, tallies, selection, bulk actions or the conflict queue — needs
 # a blocked gate of its own.
 ROLE_NODE = Qt.UserRole + 1
+# The UnmetDependency an inert dependency row stands for (its item has no ROLE_NODE).
+ROLE_UNMET = Qt.UserRole + 2
 
 # Minimum gap between cross-thread progress signals; check() reports per file.
 _PROGRESS_INTERVAL_S = 0.05
@@ -103,6 +114,21 @@ def _make_inert(item: QTreeWidgetItem) -> None:
     item.setFlags(item.flags() & ~Qt.ItemIsUserCheckable)
     for column in (0, 1):
         item.setForeground(column, QBrush(_GREY))
+
+
+def _unmet_text(unmet: UnmetDependency, ignored: bool) -> str:
+    suffix = " (ignored for this rule)" if ignored else ""
+    return (
+        f"Unmet dependency — '{master_basename(unmet.depends_on.path)}' "
+        f"expected alongside '{master_basename(unmet.master.path)}'{suffix}."
+    )
+
+
+def show_save_failed(parent, exc: Exception) -> None:
+    """The one warning for a config save that didn't land; a clobber is
+    fixed by reloading first."""
+    hint = "\n\nUse Reload config, then try again." if isinstance(exc, ConfigClobberError) else ""
+    QMessageBox.warning(parent, "Save failed", f"{exc}{hint}")
 
 
 def _inert_item(parent, name: str, change: str = "", action: str = "") -> QTreeWidgetItem:
@@ -191,6 +217,12 @@ class ReviewPane(QWidget):
         self._worker: CheckWorker | None = None
         self._check_cancelled = False
         self._checking = False
+        # What the tree on screen was built with: its rule's unmet dependencies,
+        # grouped by their master's path_key, whether it ignores them, and the
+        # dependency rows drawn for them.
+        self._unmet_by_master: dict[str, list[UnmetDependency]] = {}
+        self._dependencies_ignored = False
+        self._unmet_rows: list[QTreeWidgetItem] = []
 
         app = QCoreApplication.instance()
         if app is not None:
@@ -211,6 +243,11 @@ class ReviewPane(QWidget):
         self.status_label = QLabel("Not checked yet.")
         self.status_label.setWordWrap(True)
 
+        self.chk_ignore_dependencies = QCheckBox("Ignore dependencies")
+        self.chk_ignore_dependencies.setToolTip(
+            "Silence this rule's unmet dependencies without adding their masters."
+        )
+        self.chk_ignore_dependencies.toggled.connect(self._toggle_ignore_dependencies)
         self.btn_check = QPushButton("Check")
         self.btn_cancel_check = QPushButton("Cancel check")
         self.btn_cancel_check.hide()
@@ -234,6 +271,7 @@ class ReviewPane(QWidget):
             self.btn_resolve,
         ):
             action_row.addWidget(button)
+        action_row.addWidget(self.chk_ignore_dependencies)
         action_row.addStretch(1)
         action_lay = QVBoxLayout(actions)
         action_lay.addWidget(self.status_label)
@@ -285,6 +323,15 @@ class ReviewPane(QWidget):
         without invalidating any review.
         """
         self._repopulate_and_select(self._current_rule_id, adoption.unchanged)
+        rule = self._session.rules.get(self._current_rule_id)
+        if rule is not None and rule.id in adoption.unchanged:
+            # A surviving rule skips the row-change redraw, but an Ignore
+            # dependencies flip (the checkbox, or a reloaded hand edit) keeps
+            # its review while changing how its dependency rows and the box read.
+            if rule.ignore_dependencies != self._dependencies_ignored:
+                self._show_rule(rule.id)
+            else:
+                self._refresh_bar()
         if adoption.replica_names_changed:
             # The tree shows names, so a rename relabels it even for a rule
             # whose cached review (and so its tree) is still accurate.
@@ -424,6 +471,7 @@ class ReviewPane(QWidget):
         if row < 0:
             self._current_rule_id = None
             self.tree.clear()
+            self._refresh_bar()
             return
         self._current_rule_id = self.rule_list.item(row).data(Qt.UserRole)
         self._show_rule(self._current_rule_id)
@@ -441,9 +489,15 @@ class ReviewPane(QWidget):
         self._populate_tree(review_rule)
         self._apply_selection_to_tree(rule_id)
         self._expand_drifted()
+        self._expand_unmet()
         self._refresh_bar()
 
     def _populate_tree(self, review_rule: ReviewRule, preview: bool = False) -> None:
+        self._dependencies_ignored = review_rule.dependencies_ignored
+        self._unmet_by_master = {}
+        for unmet in review_rule.unmet_dependencies:
+            self._unmet_by_master.setdefault(path_key(unmet.master.path), []).append(unmet)
+        self._unmet_rows = []
         with QSignalBlocker(self.tree):
             self.tree.clear()
             for replica in review_rule.replicas:
@@ -485,6 +539,7 @@ class ReviewPane(QWidget):
         preview = self._session.preview(rule, layout)
         self._populate_tree(preview, preview=True)
         self.tree.expandToDepth(0)
+        self._expand_unmet()
 
     def _collision_banner(self, rule_id: str, collision: NamespaceCollision) -> str:
         others = other_rule_names(collision, rule_id, self._session.rules)
@@ -494,6 +549,39 @@ class ReviewPane(QWidget):
         )
 
     def _build_item(self, parent, node, preview: bool = False) -> QTreeWidgetItem:
+        item = self._build_node_item(parent, node, preview)
+        if isinstance(node, ReviewMaster):
+            self._add_unmet_rows(item, node, preview)
+        return item
+
+    def _add_unmet_rows(self, item: QTreeWidgetItem, master: ReviewMaster, preview: bool) -> None:
+        """One inert row per dependency `master` has unmet — a sibling of
+        Master missing / collision, not exclusive with them. Violet with an
+        Accept offer; grey and offerless once the rule ignores dependencies.
+        A preview shows the same badge but, like Unlock, no action. Only an
+        offered row carries ROLE_UNMET, so the click acts on exactly the rows
+        that promise it."""
+        ignored = self._dependencies_ignored
+        offered = not ignored and not preview
+        for unmet in self._unmet_by_master.get(path_key(master.master.path), ()):
+            row = _inert_item(item, "", _unmet_text(unmet, ignored), "Accept →" if offered else "")
+            if not ignored:
+                row.setForeground(1, QBrush(_VIOLET))
+            if offered:
+                row.setData(0, ROLE_UNMET, unmet)
+            self._unmet_rows.append(row)
+
+    def _expand_unmet(self) -> None:
+        """A dependency row is the point of the badge, so it never sits inside
+        a collapsed branch (the drift-based expansion knows nothing of it, so
+        this runs after it)."""
+        for row in self._unmet_rows:
+            ancestor = row.parent()
+            while ancestor is not None:
+                ancestor.setExpanded(True)
+                ancestor = ancestor.parent()
+
+    def _build_node_item(self, parent, node, preview: bool = False) -> QTreeWidgetItem:
         """`preview` draws the pre-check tree: replicas read "Not checked", and
         nothing is tickable or unlockable until a check runs."""
         if isinstance(node, ReviewMaster) and node.blocked:
@@ -594,6 +682,10 @@ class ReviewPane(QWidget):
     # -- action bar --------------------------------------------------------
 
     def _refresh_bar(self) -> None:
+        rule = self._session.rules.get(self._current_rule_id)
+        with QSignalBlocker(self.chk_ignore_dependencies):
+            self.chk_ignore_dependencies.setChecked(rule is not None and rule.ignore_dependencies)
+        self.chk_ignore_dependencies.setEnabled(rule is not None)
         rule_id = self._checked_rule_id()
         if rule_id is None:
             for button in (self.btn_sync_selected, self.btn_sync_all_safe, self.btn_resolve):
@@ -607,6 +699,27 @@ class ReviewPane(QWidget):
         self.btn_sync_all_safe.setEnabled(counts["safe"] > 0)
         self.btn_resolve.setText(f"Resolve conflicts → ({counts['conflict']})")
         self.btn_resolve.setEnabled(counts["conflict"] > 0)
+
+    def _toggle_ignore_dependencies(self, checked: bool) -> None:
+        rule_id = self._current_rule_id
+        if rule_id is None:
+            return
+        try:
+            adoption = self._session.set_ignore_dependencies(rule_id, checked)
+        except ConfigClobberError as exc:
+            show_save_failed(self, exc)
+            self._refresh_bar()  # puts the box back to what's saved
+            return
+        self.apply_adoption(adoption)
+
+    def _accept_dependency(self, rule_id: str, unmet: UnmetDependency) -> None:
+        try:
+            adoption = self._session.accept_dependency(rule_id, unmet)
+        except (ConfigClobberError, DuplicateMasterError) as exc:
+            show_save_failed(self, exc)
+            return
+        self.apply_adoption(adoption)
+        self._run_next_check()
 
     def _unlock_master(self, rule_id: str, landing_path: str) -> None:
         self._session.unlock(rule_id, landing_path)
@@ -625,7 +738,10 @@ class ReviewPane(QWidget):
         if column != 2 or self._checked_rule_id() is None:
             return
         node = item.data(0, ROLE_NODE)
-        if isinstance(node, ReviewLeaf) and node.resolvable:
+        unmet = item.data(0, ROLE_UNMET)
+        if unmet is not None:
+            self._accept_dependency(self._current_rule_id, unmet)
+        elif isinstance(node, ReviewLeaf) and node.resolvable:
             self._run_conflict_dialog(self._current_rule_id, [node])
         elif isinstance(node, ReviewMaster) and node.unlock_offered:
             self._unlock_master(self._current_rule_id, node.landing_path)

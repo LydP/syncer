@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
 
 from syncer import app_version
 from syncer.config import Config, ConfigClobberError, SyncRule, without_rule
-from syncer.gui.review_pane import ReviewPane
+from syncer.gui.review_pane import ReviewPane, show_save_failed
 from syncer.gui.rule_dialog import RuleDialog
 from syncer.gui.update_dialog import UpdateDialog
 from syncer.session import ConfigAdoption, Session
@@ -243,7 +243,7 @@ class MainWindow(QMainWindow):
         try:
             adoption = self._session.save_config(config)
         except ConfigClobberError as exc:
-            QMessageBox.warning(self, "Save failed", f"{exc}\n\nUse Reload config, then try again.")
+            show_save_failed(self, exc)
             return
         self._show_adoption(adoption)
 
