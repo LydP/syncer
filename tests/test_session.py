@@ -8,6 +8,7 @@ from syncer.config import (
     Config,
     ConfigClobberError,
     ConfigStore,
+    Dependency,
     Master,
     ReplicaName,
     SyncRule,
@@ -32,9 +33,10 @@ def _rule(master_dir, replica_dir, rule_id="r1"):
     )
 
 
-def _session(layout, *rules, state=EMPTY_STATE):
+def _session(layout, *rules, state=EMPTY_STATE, dependencies=()):
     store = ConfigStore(layout.config_path, layout.backups_dir)
-    return Session(layout, store, Config(version=1, rules=list(rules)), state)
+    config = Config(version=1, rules=list(rules), dependencies=list(dependencies))
+    return Session(layout, store, config, state)
 
 
 def _run(job):
@@ -640,3 +642,77 @@ def test_a_resolution_applied_before_the_dialog_closes_early_is_kept(master_and_
     assert (replica / "master" / second.name).read_text() == f"{second.name} edited in the replica"
     assert [leaf.name for leaf in session.conflict_queue("r1")] == [second.name]
     assert load_state(layout.state_path).state == session.state
+
+
+def _dep_setup(tmp_path, layout):
+    lib, app, replica = tmp_path / "lib", tmp_path / "app", tmp_path / "rep"
+    for d in (lib, app, replica):
+        d.mkdir()
+    (lib / "l.txt").write_text("l")
+    (app / "a.txt").write_text("a")
+    rule = _rule(app, replica)
+    dep = Dependency(master=rule.masters[0], depends_on=Master(str(lib), "dir"))
+    return _session(layout, rule, dependencies=[dep]), dep
+
+
+def test_unmet_dependencies_reach_the_tree_and_the_job(tmp_path, layout):
+    session, dep = _dep_setup(tmp_path, layout)
+    session.queue_check("r1")
+    job = session.next_check()
+    assert [(u.master, u.depends_on) for u in job.unmet] == [(dep.master, dep.depends_on)]
+
+    session.check_finished(job, _run(job), cancelled=False)
+
+    assert session.tree("r1").unmet_dependencies == job.unmet
+
+
+def test_accept_dependency_appends_the_master_saves_and_requeues(tmp_path, layout):
+    session, dep = _dep_setup(tmp_path, layout)
+    _checked(session)
+    unmet = session.tree("r1").unmet_dependencies[0]
+
+    adoption = session.accept_dependency("r1", unmet)
+
+    assert "r1" not in adoption.unchanged
+    assert session.rules["r1"].masters[-1] == dep.depends_on
+    assert load_config(layout.config_path).rules[0].masters[-1] == dep.depends_on
+    assert session.has_pending_checks()
+    _checked(session)
+    assert session.tree("r1").unmet_dependencies == []
+
+
+def test_ignore_dependencies_keeps_the_review_and_patches_the_flag(tmp_path, layout):
+    session, _ = _dep_setup(tmp_path, layout)
+    _checked(session)
+
+    adoption = session.set_ignore_dependencies("r1", True)
+
+    assert "r1" in adoption.unchanged
+    assert session.tree("r1").dependencies_ignored is True
+    assert session.rules["r1"].ignore_dependencies is True
+    assert not session.has_pending_checks()
+
+
+def test_editing_dependencies_drops_the_review_of_rules_whose_unmet_list_changed(
+    tmp_path, layout
+):
+    session, _ = _dep_setup(tmp_path, layout)
+    _checked(session)
+
+    adoption = session.set_dependencies([])
+
+    assert "r1" not in adoption.unchanged
+    assert session.tree("r1") is None
+
+
+def test_a_result_whose_unmet_dependencies_changed_mid_check_is_requeued(tmp_path, layout):
+    session, _ = _dep_setup(tmp_path, layout)
+    session.queue_check("r1")
+    job = session.next_check()
+    result = _run(job)
+
+    session.set_dependencies([])
+    outcome = session.check_finished(job, result, cancelled=False)
+
+    assert outcome == CheckOutcome(rule_id="r1", applied=False)
+    assert session.has_pending_checks()

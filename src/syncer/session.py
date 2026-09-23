@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from typing import NamedTuple
 
 from syncer.check import (
@@ -22,10 +23,12 @@ from syncer.check import (
     FileChange,
     MasterLayout,
     NamespaceCollision,
+    UnmetDependency,
     collisions_for_rule,
     find_namespace_collisions,
+    find_unmet_dependencies,
 )
-from syncer.config import Config, ConfigStore, SyncRule
+from syncer.config import Config, ConfigStore, Dependency, SyncRule, with_rule
 from syncer.conflict import apply_keep_replica, bulk_candidates_by_category, conflict_queue
 from syncer.review import (
     LeafKey,
@@ -64,12 +67,14 @@ class ConfigAdoption(NamedTuple):
 
 class CheckJob(NamedTuple):
     """One check for the Qt layer to run off-thread, as `Session.next_check`
-    hands it out. Carries the rule, baseline and collisions the check is made
-    against, so `check_finished` can tell whether they have since changed."""
+    hands it out. Carries the rule, baseline, collisions and unmet dependencies
+    the check is made against, so `check_finished` can tell whether they have
+    since changed."""
 
     rule: SyncRule
     baseline: dict
     collisions: list[NamespaceCollision]
+    unmet: list[UnmetDependency]
 
     @property
     def rule_id(self) -> str:
@@ -99,6 +104,7 @@ class Session:
         # Recomputed only where _rules_by_id is, not per rule checked, since a
         # check-all checks every rule in turn.
         self._namespace_collisions = find_namespace_collisions(config.rules)
+        self._unmet = _unmet_by_rule(config)
         self._review: dict[str, ReviewRule] = {}
         self._selected: defaultdict[str, frozenset[LeafKey]] = defaultdict(frozenset)
         self._pending_checks: list[str] = []
@@ -123,6 +129,29 @@ class Session:
         self._config_store.save(config)
         return self.adopt_config(config)
 
+    def accept_dependency(self, rule_id: str, unmet: UnmetDependency) -> ConfigAdoption:
+        """Adds `unmet.depends_on` to the rule as its last master (CONTEXT.md's
+        **Accept**) and re-checks the rule. `DuplicateMasterError` and
+        `ConfigClobberError` propagate before anything is adopted. A namespace
+        collision the new master causes falls out of `adopt_config`."""
+        rule = self._rules_by_id[rule_id]
+        edited = replace(rule, masters=[*rule.masters, unmet.depends_on])
+        adoption = self.save_config(with_rule(self._config, edited))
+        self.queue_check(rule_id)
+        return adoption
+
+    def set_ignore_dependencies(self, rule_id: str, value: bool) -> ConfigAdoption:
+        """Saves the rule's Ignore dependencies flag. The rule's review is kept
+        (`adopt_config` patches its flag), since the flag changes no file's
+        drift."""
+        edited = replace(self._rules_by_id[rule_id], ignore_dependencies=value)
+        return self.save_config(with_rule(self._config, edited))
+
+    def set_dependencies(self, dependencies: list[Dependency]) -> ConfigAdoption:
+        """Saves an edited dependency list (the declaration popup). Rules whose
+        unmet dependencies it changes lose their review, like any edited rule."""
+        return self.save_config(replace(self._config, dependencies=list(dependencies)))
+
     def reload_config(self) -> ConfigAdoption:
         """Re-reads `config.toml` and adopts it. A config that can't be read
         raises a `SyncerError` before anything is adopted."""
@@ -145,22 +174,28 @@ class Session:
         """
         old_rules_by_id = self._rules_by_id
         old_collisions = self._namespace_collisions
+        old_unmet = self._unmet
         replica_names_changed = config.replica_names != self._config.replica_names
         self._state = reconcile_and_save(self._layout.state_path, self._state, config)
         self._config = config
         self._rules_by_id = {rule.id: rule for rule in config.rules}
         self._namespace_collisions = find_namespace_collisions(config.rules)
+        self._unmet = _unmet_by_rule(config)
         self._pending_checks = [k for k in self._pending_checks if k in self._rules_by_id]
         # Another rule's edit can add or clear a collision on an otherwise
-        # unchanged rule, so its cached review is stale then too.
+        # unchanged rule, so its cached review is stale then too. So can an
+        # edited dependency edge, which changes no SyncRule.
         unchanged = frozenset(
             rule_id
             for rule_id, rule in self._rules_by_id.items()
-            if old_rules_by_id.get(rule_id) == rule
-            and collisions_for_rule(rule_id, old_collisions)
-            == collisions_for_rule(rule_id, self._namespace_collisions)
+            if _check_inputs(old_rules_by_id.get(rule_id), old_collisions, old_unmet.get(rule_id))
+            == _check_inputs(rule, self._namespace_collisions, self._unmet[rule_id])
         )
-        self._review = {k: v for k, v in self._review.items() if k in unchanged}
+        self._review = {
+            k: replace(v, dependencies_ignored=self._rules_by_id[k].ignore_dependencies)
+            for k, v in self._review.items()
+            if k in unchanged
+        }
         self._selected = defaultdict(
             frozenset, {k: v for k, v in self._selected.items() if k in unchanged}
         )
@@ -196,6 +231,7 @@ class Session:
             self._rules_by_id[rule_id],
             baseline_for_rule(self._state, rule_id),
             self._namespace_collisions,
+            self._unmet[rule_id],
         )
 
     def check_finished(self, job: CheckJob, result: CheckResult, cancelled: bool) -> CheckOutcome:
@@ -203,19 +239,25 @@ class Session:
             # Truncated: applying it would under-report drift (even "in sync").
             return CheckOutcome(job.rule_id, applied=False)
         current_rule = self._rules_by_id.get(job.rule_id)
-        if current_rule != job.rule or collisions_for_rule(
-            job.rule_id, job.collisions
-        ) != collisions_for_rule(job.rule_id, self._namespace_collisions):
+        if _check_inputs(job.rule, job.collisions, job.unmet) != _check_inputs(
+            current_rule, self._namespace_collisions, self._unmet.get(job.rule_id)
+        ):
             # The rule was deleted or edited mid-check, or another rule's edit
-            # changed its collisions: this result describes the old config, so
-            # syncing it could write to a replica or namespace no longer valid.
+            # changed its collisions or unmet dependencies: this result
+            # describes the old config, so syncing it could write to a replica
+            # or namespace no longer valid.
             # A surviving rule is checked again; a deleted one isn't.
             if current_rule is not None:
                 self.queue_check(job.rule_id)
             return CheckOutcome(job.rule_id, applied=False)
         # A fresh tree carries no unlocks, so a re-check re-blocks any master
         # still missing structurally (spec.md §8).
-        self._review[job.rule_id] = build_review_rule(result, collisions=self._namespace_collisions)
+        self._review[job.rule_id] = build_review_rule(
+            result,
+            collisions=self._namespace_collisions,
+            unmet_dependencies=self._unmet[job.rule_id],
+            dependencies_ignored=current_rule.ignore_dependencies,
+        )
         return CheckOutcome(job.rule_id, applied=True)
 
     def tree(self, rule_id: str) -> ReviewRule | None:
@@ -267,7 +309,12 @@ class Session:
         run — built against the session's collisions so blocking matches a
         real check's tree. `master_layout` is `scan_master_layout`'s result,
         not this session's `layout` (which is the storage one)."""
-        return build_preview_rule(rule, master_layout, self._namespace_collisions)
+        return build_preview_rule(
+            rule,
+            master_layout,
+            self._namespace_collisions,
+            find_unmet_dependencies(rule, self._config.dependencies),
+        )
 
     def toggle(self, rule_id: str, node: ReviewNode | ReviewBranch) -> None:
         self._selected[rule_id] = toggle(node, self._selected[rule_id])
@@ -349,3 +396,25 @@ class Session:
         result = self.overwrite(rule_id, changes)
         self._selected[rule_id] = frozenset()
         return result
+
+
+def _unmet_by_rule(config: Config) -> dict[str, list[UnmetDependency]]:
+    return {rule.id: find_unmet_dependencies(rule, config.dependencies) for rule in config.rules}
+
+
+def _check_inputs(
+    rule: SyncRule | None,
+    collisions: list[NamespaceCollision],
+    unmet: list[UnmetDependency] | None,
+) -> tuple | None:
+    """What a rule's review is built from, as one comparable key — so
+    `adopt_config` and `check_finished` agree on when a review is stale. None
+    for a deleted rule. The Ignore dependencies flag is left out: it changes no
+    file's drift, so flipping it keeps the review."""
+    if rule is None:
+        return None
+    return (
+        replace(rule, ignore_dependencies=False),
+        collisions_for_rule(rule.id, collisions),
+        unmet,
+    )
