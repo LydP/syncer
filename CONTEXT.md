@@ -94,7 +94,7 @@ The standing fact that a rule contains master A, A depends on master B, and the 
 _Avoid_: acknowledged, dismissed (superseded — see **Ignore dependencies**)
 
 **Ignore dependencies**:
-A per-rule checkbox, set in the rule editor, that blanket-silences every dependency still unmet for that rule — past, present, or future — without adding any of their masters. A dependency the user already accepted (its master added to the rule) is satisfied, not silenced, and unaffected by the box. The rule-level badge from **Unmet dependency** stays visible either way; checking the box only changes its tone, from an actionable "unmet dependency — accept?" prompt to a passive "unmet dependency — ignored for this rule" note.
+A per-rule checkbox, set from the review tree's action bar, that blanket-silences every dependency still unmet for that rule — past, present, or future — without adding any of their masters. A dependency the user already accepted (its master added to the rule) is satisfied, not silenced, and unaffected by the box. The rule-level badge from **Unmet dependency** stays visible either way; checking the box only changes its tone, from an actionable "unmet dependency — accept?" prompt to a passive "unmet dependency — ignored for this rule" note.
 _Avoid_: acknowledge, dismiss (the box is a standing rule setting, not a per-instance action)
 
 **Cross-rule namespace collision**:
