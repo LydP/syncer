@@ -28,7 +28,13 @@ jobs:
       - name: Build and zip standalone executable
         run: python scripts/build.py --release-tag "$env:GITHUB_REF_NAME"
 
+      # Notes come from docs/releases/<tag>.md when it exists; the app's
+      # update dialog shows them. Without one, fall back to GitHub's
+      # generated notes (only a compare link, since nothing lands via PR).
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "$env:GITHUB_REF_NAME" (Get-ChildItem dist/*.zip).FullName --title "$env:GITHUB_REF_NAME" --generate-notes
+        run: |
+          $notes = "docs/releases/$env:GITHUB_REF_NAME.md"
+          $notesArgs = @(if (Test-Path $notes) { "--notes-file", $notes } else { "--generate-notes" })
+          gh release create "$env:GITHUB_REF_NAME" (Get-ChildItem dist/*.zip).FullName --title "$env:GITHUB_REF_NAME" @notesArgs

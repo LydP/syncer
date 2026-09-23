@@ -56,7 +56,8 @@ standing up new infrastructure.
   force awkward boundaries.
 - **A `CHANGELOG.md`**: deferred, not rejected outright — the GitHub issue tracker already
   records what changed and why for a solo audience; revisit once there's a real external audience
-  reading release notes.
+  reading release notes. (Amended for v0.3.0: release notes now live in per-release files
+  instead — see Consequences.)
 
 ## Consequences
 
@@ -76,6 +77,14 @@ standing up new infrastructure.
   to be tedium updating the user's own multiple machines by hand, not a wider audience. It is now
   decided in [ADR 0004](0004-app-update.md): user-triggered and offline-by-default, distributed
   through these same GitHub Releases zips. Code signing stays deferred.
+- Release notes are hand-written per release in `docs/releases/vX.Y.Z.md`, committed with the
+  version bump, and passed to `gh release create --notes-file` by the release workflow (falling
+  back to `--generate-notes` if the file is missing). There was a real reader for release notes
+  sooner than the `CHANGELOG.md` deferral expected: ADR 0004's update dialog shows the release
+  body in the app, with links not clickable. GitHub's generated notes gave that dialog only a
+  compare link, because work lands on `master` directly, not through PRs. Notes describe
+  user-visible changes only, not internal refactors, and don't link to issues. A release is
+  immutable once published, so the notes file must exist before the tag is pushed.
 - Implementation tracked in the same map's child tickets: the Nuitka build script, the GUI
   version display, the GitHub Actions release workflow, and cutting a first real release
   end-to-end.
