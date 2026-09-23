@@ -21,6 +21,8 @@ from syncer.config import (
     ReplicaName,
     SyncRule,
     default_rule_name,
+    dependencies_of,
+    find_dependency_conflict,
     find_master_conflict,
     find_name_conflict,
     find_replica_name_conflict,
@@ -30,8 +32,10 @@ from syncer.config import (
     path_key,
     replica_label,
     save_config,
+    with_dependency,
     with_replica_name,
     with_rule,
+    without_dependency,
     without_rule,
 )
 
@@ -535,6 +539,58 @@ def test_save_config_rejects_a_duplicate_dependency_ignoring_case_and_slash_form
         save_config(layout.config_path, config, layout.backups_dir)
 
     assert not layout.config_path.exists()
+
+
+def test_dependencies_of_returns_only_that_masters_edges_however_its_path_is_spelled():
+    config = Config(
+        version=1,
+        dependencies=[
+            _dependency(r"C:\a", r"C:\b"),
+            _dependency(r"C:\x", r"C:\y"),
+            _dependency("c:/A", r"C:\c"),
+        ],
+    )
+
+    assert dependencies_of(config, r"C:\A") == [
+        _dependency(r"C:\a", r"C:\b"),
+        _dependency("c:/A", r"C:\c"),
+    ]
+
+
+def test_with_dependency_appends_the_edge():
+    config = Config(version=1, dependencies=[_dependency(r"C:\a", r"C:\b")])
+
+    updated = with_dependency(config, _dependency(r"C:\a", r"C:\c"))
+
+    assert updated.dependencies == [_dependency(r"C:\a", r"C:\b"), _dependency(r"C:\a", r"C:\c")]
+
+
+def test_without_dependency_removes_the_edge_however_either_end_is_spelled():
+    config = Config(
+        version=1,
+        dependencies=[_dependency(r"C:\a", r"C:\b"), _dependency(r"C:\a", r"C:\c")],
+    )
+
+    updated = without_dependency(config, _dependency("c:/A", "C:/B"))
+
+    assert updated.dependencies == [_dependency(r"C:\a", r"C:\c")]
+
+
+def test_find_dependency_conflict_is_none_for_a_new_acyclic_edge():
+    config = Config(version=1, dependencies=[_dependency(r"C:\a", r"C:\b")])
+
+    assert find_dependency_conflict(config, _dependency(r"C:\b", r"C:\c")) is None
+
+
+@pytest.mark.parametrize(
+    "edge",
+    [("c:/A", "C:/B"), (r"C:\b", r"C:\a"), (r"C:\a", r"C:\a")],
+    ids=["duplicate", "cycle", "self-edge"],
+)
+def test_find_dependency_conflict_explains_a_duplicate_or_cycle(edge):
+    config = Config(version=1, dependencies=[_dependency(r"C:\a", r"C:\b")])
+
+    assert find_dependency_conflict(config, _dependency(*edge))
 
 
 def test_load_config_rejects_a_duplicate_dependency(layout):

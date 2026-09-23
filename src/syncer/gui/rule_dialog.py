@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QPushButton,
+    QRadioButton,
     QVBoxLayout,
 )
 
@@ -44,9 +45,12 @@ from syncer.check import (
 )
 from syncer.config import (
     Config,
+    Dependency,
     Master,
     SyncRule,
     default_rule_name,
+    dependencies_of,
+    find_dependency_conflict,
     find_master_conflict,
     find_name_conflict,
     find_replica_name_conflict,
@@ -55,10 +59,12 @@ from syncer.config import (
     path_key,
     replica_label,
     replica_name,
+    with_dependency,
     with_replica_name,
     with_rule,
+    without_dependency,
 )
-from syncer.landing import master_basename_key
+from syncer.landing import master_basename, master_basename_key
 from syncer.storage import BaseDirNotWritableError, ensure_base_dir_writable
 
 _ERROR_COLOR = "#b3261e"
@@ -74,6 +80,119 @@ _MASTER_CONFLICT_TEXT = {
     "path": lambda other: "same path as another master in this rule",
     "basename": lambda other: f"same name as '{other.path}' in this rule",
 }
+
+
+def _pick_path(parent, master_type: str, role: str) -> str:
+    if master_type == "file":
+        return QFileDialog.getOpenFileName(parent, f"Choose {role} file")[0]
+    return QFileDialog.getExistingDirectory(parent, f"Choose {role} folder")
+
+
+class MasterDependenciesDialog(QDialog):
+    """The paths one master depends on (ADR 0006, issue #61). Edits a copy of
+    `config`'s global dependency list; `config` is the result on accept.
+
+    The dependency may name a path no rule lists yet, so "Add" takes a free
+    path plus a type rather than picking from the rule's masters. Duplicate and
+    cycle rejection is `config.find_dependency_conflict`, the same check a save
+    runs, shown inline as a blocking error.
+    """
+
+    def __init__(self, master: Master, config: Config, parent=None):
+        super().__init__(parent)
+        self._master = master
+        self.config = config
+        name = master_basename(master.path)
+        self.setWindowTitle(f"Dependencies for {name}")
+        self.setMinimumWidth(420)
+
+        self.dep_list = QListWidget()
+        self.btn_remove = QPushButton("Remove selected")
+        self.btn_remove.clicked.connect(self._remove_selected)
+
+        self.path_edit = QLineEdit()
+        self.path_edit.setPlaceholderText(r"Path this master depends on, e.g. C:\skills\shared")
+        self.btn_browse = QPushButton("Browse…")
+        self.btn_browse.clicked.connect(self._browse)
+        self.type_file = QRadioButton("File")
+        self.type_dir = QRadioButton("Folder")
+        self.type_dir.setChecked(True)
+        self.btn_add = QPushButton("Add")
+        self.btn_add.clicked.connect(self._add)
+        add_row = QHBoxLayout()
+        add_row.addWidget(self.path_edit, 1)
+        add_row.addWidget(self.btn_browse)
+        type_row = QHBoxLayout()
+        type_row.addWidget(self.type_file)
+        type_row.addWidget(self.type_dir)
+        type_row.addStretch(1)
+        type_row.addWidget(self.btn_add)
+
+        self.error = QLabel()
+        self.error.setStyleSheet(_ERROR_STYLE)
+        self.error.setWordWrap(True)
+        self.error.hide()
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(f"'{name}' depends on:"))
+        layout.addWidget(self.dep_list, 1)
+        layout.addWidget(self.btn_remove)
+        layout.addLayout(add_row)
+        layout.addLayout(type_row)
+        layout.addWidget(self.error)
+        layout.addWidget(buttons)
+        self._refresh()
+
+    def _type(self) -> str:
+        return "file" if self.type_file.isChecked() else "dir"
+
+    def _refresh(self) -> None:
+        self.dep_list.clear()
+        for dependency in dependencies_of(self.config, self._master.path):
+            item = QListWidgetItem(dependency.depends_on.path)
+            item.setToolTip(f"{dependency.depends_on.type}: {dependency.depends_on.path}")
+            self.dep_list.addItem(item)
+
+    def _browse(self) -> None:
+        path = _pick_path(self, self._type(), "dependency")
+        if path:
+            self.path_edit.setText(native_path(path))
+
+    def _show_error(self, text: str) -> None:
+        self.error.setText(text)
+        self.error.show()
+
+    def _add(self) -> None:
+        text = self.path_edit.text().strip()
+        if not text:
+            return
+        if not Path(text).is_absolute():
+            self._show_error(r"Enter a full path, e.g. C:\skills\shared.")
+            return
+        dependency = Dependency(
+            master=self._master, depends_on=Master(path=native_path(text), type=self._type())
+        )
+        conflict = find_dependency_conflict(self.config, dependency)
+        if conflict is not None:
+            self._show_error(conflict)
+            return
+        self.config = with_dependency(self.config, dependency)
+        self.error.hide()
+        self.path_edit.clear()
+        self._refresh()
+
+    def _remove_selected(self) -> None:
+        row = self.dep_list.currentRow()
+        if row < 0:
+            return
+        doomed = dependencies_of(self.config, self._master.path)[row]
+        self.config = without_dependency(self.config, doomed)
+        self.error.hide()
+        self._refresh()
 
 
 class RuleDialog(QDialog):
@@ -114,6 +233,13 @@ class RuleDialog(QDialog):
         master_buttons.addWidget(self.btn_add_master_file)
         master_buttons.addWidget(self.btn_add_master_dir)
         master_buttons.addWidget(self.btn_remove_master)
+        self.btn_master_deps = QPushButton("Dependencies for selected master…")
+        self.btn_master_deps.setEnabled(False)
+        self.btn_master_deps.clicked.connect(self._edit_master_dependencies)
+        self.master_list.currentRowChanged.connect(
+            lambda row: self.btn_master_deps.setEnabled(row >= 0)
+        )
+        master_buttons.addWidget(self.btn_master_deps)
         master_buttons.addStretch(1)
         self.master_error = QLabel()
         self.master_error.setStyleSheet(_ERROR_STYLE)
@@ -174,11 +300,6 @@ class RuleDialog(QDialog):
         self._refresh_master_list()
         self._refresh_replica_list()
 
-    def _pick_path(self, master_type: str, role: str) -> str:
-        if master_type == "file":
-            return QFileDialog.getOpenFileName(self, f"Choose {role} file")[0]
-        return QFileDialog.getExistingDirectory(self, f"Choose {role} folder")
-
     # -- draft rule, for live cross-rule collision preview ------------------
 
     def _rule_named(self, name: str) -> SyncRule:
@@ -205,7 +326,7 @@ class RuleDialog(QDialog):
     # -- masters -------------------------------------------------------
 
     def _add_master(self, master_type: str) -> None:
-        path = self._pick_path(master_type, "master")
+        path = _pick_path(self, master_type, "master")
         if not path:
             return
         path = native_path(path)
@@ -221,6 +342,19 @@ class RuleDialog(QDialog):
         if row >= 0:
             del self._masters[row]
             self._refresh_master_list()
+
+    def _edit_master_dependencies(self) -> None:
+        row = self.master_list.currentRow()
+        if row < 0:
+            return
+        popup = MasterDependenciesDialog(self._masters[row], self._config, self)
+        try:
+            if popup.exec() == QDialog.Accepted:
+                # Global, like replica names: accumulates on self._config and
+                # lands with the rule when the dialog is accepted.
+                self._config = popup.config
+        finally:
+            popup.deleteLater()
 
     def _namespace_collision_text(
         self,
@@ -276,7 +410,7 @@ class RuleDialog(QDialog):
         event.acceptProposedAction()
 
     def _browse_replica(self) -> None:
-        path = self._pick_path("dir", "replica")
+        path = _pick_path(self, "dir", "replica")
         if path:
             self._add_replica(path)
 

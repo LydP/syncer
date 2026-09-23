@@ -257,6 +257,40 @@ def with_replica_name(config: Config, path: str, name: str) -> Config:
     return replace(config, replica_names=replica_names)
 
 
+def dependencies_of(config: Config, master_path: str) -> list[Dependency]:
+    """The dependencies declared for the master at `master_path`, in config
+    order. Matched on `path_key`, like `replica_name`."""
+    target = path_key(master_path)
+    return [d for d in config.dependencies if path_key(d.master.path) == target]
+
+
+def find_dependency_conflict(config: Config, dependency: Dependency) -> str | None:
+    """Why adding `dependency` would be rejected — a duplicate or a cycle — or
+    None. Non-raising counterpart to load_config's DuplicateDependencyError /
+    DependencyCycleError, for the dependency popup's inline validation; runs
+    the very check a save would."""
+    try:
+        _validate_dependencies(with_dependency(config, dependency).dependencies)
+    except (DuplicateDependencyError, DependencyCycleError) as exc:
+        return str(exc)
+    return None
+
+
+def with_dependency(config: Config, dependency: Dependency) -> Config:
+    """`config` with `dependency` appended — `with_rule`'s sibling."""
+    return replace(config, dependencies=[*config.dependencies, dependency])
+
+
+def without_dependency(config: Config, dependency: Dependency) -> Config:
+    """`config` with `dependency` removed, whatever way either end's path is
+    spelled — `with_dependency`'s inverse."""
+    doomed = dependency_key(dependency)
+    return replace(
+        config,
+        dependencies=[d for d in config.dependencies if dependency_key(d) != doomed],
+    )
+
+
 def replica_label(config: Config, path: str) -> str:
     """What to show for the replica at `path`: its name, else the path itself.
     The one place that rule lives, for every screen that shows a replica."""
